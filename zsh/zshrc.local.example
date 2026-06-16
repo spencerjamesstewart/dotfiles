@@ -1,0 +1,11 @@
+# ~/.zshrc.local  —  machine-local, NEVER committed (gitignored).
+# Copy this to ~/.zshrc.local and fill in your real values.
+#
+# This is where secrets and per-machine overrides live, so the public
+# dotfiles repo stays free of credentials.
+
+# --- Secrets ---
+export ANTHROPIC_API_KEY="sk-ant-REPLACE_ME"
+
+# --- Per-machine overrides (optional) ---
+# export EDITOR="nvim"

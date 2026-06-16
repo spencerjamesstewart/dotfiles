@@ -1,0 +1,10 @@
+# Machine-local secrets & overrides — must never be committed
+*.local
+.zshrc.local
+
+# macOS cruft
+.DS_Store
+
+# Editor scratch
+*.swp
+*~

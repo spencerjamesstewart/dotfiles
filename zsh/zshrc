@@ -1,0 +1,29 @@
+# ~/.zshrc  →  symlink to this file inside the dotfiles repo
+# Managed at: https://github.com/spencerjamesstewart/dotfiles
+# Load order matters: Homebrew first, syntax-highlighting last.
+
+# --- Homebrew (sets PATH for everything below; must be first) ---
+eval "$(/opt/homebrew/bin/brew shellenv)"
+
+# --- Locate this repo from the file's OWN path (symlink resolved) ---
+# Works no matter where the repo lives, and ignores any stale $DOTFILES.
+ZSH_CONF="${${(%):-%x}:A:h}"     # dir of the real zshrc file
+export DOTFILES="${ZSH_CONF:h}"  # repo root (parent of zsh/)
+
+# --- Load modules (order intentional) ---
+source "$ZSH_CONF/path.zsh"
+source "$ZSH_CONF/exports.zsh"
+source "$ZSH_CONF/aliases.zsh"
+source "$ZSH_CONF/functions.zsh"
+
+# --- Machine-local secrets & overrides (NEVER committed; see zshrc.local.example) ---
+[ -r "$HOME/.zshrc.local" ] && source "$HOME/.zshrc.local"
+
+# --- Prompt ---
+eval "$(starship init zsh)"
+
+# --- Plugins ---
+source "$(brew --prefix)/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+
+# !IMPORTANT — zsh-syntax-highlighting must be the LAST thing sourced.
+source "$(brew --prefix)/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
