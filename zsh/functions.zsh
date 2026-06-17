@@ -1,10 +1,20 @@
 # Shell functions
 
-# ask: one-shot question to an LLM, rendered as markdown in the terminal.
-# Requires: llm (with the anthropic plugin) and glow.
+# ask: one-shot question to an LLM, streamed straight to the terminal.
+# Requires: llm (with the anthropic plugin).
+# Default is VERY terse. Pass -v / --verbose for a fuller but
+# still tight answer (a short paragraph or a few bullets).
 ask() {
-  llm -m claude-haiku-4.5 -s "Answer concisely. Use markdown; wrap code in fenced blocks with a language tag." "$*" \
-    | glow -s ~/.config/glow/gruvbox.json -w $(( ${COLUMNS:-80} - 4 )) -
+  # Very terse by default.
+  local sys="You are a terminal assistant. Answer in the fewest words possible. No preamble, no sign-off, no restating the question, no caveats unless essential. Use markdown only when it genuinely helps; wrap code in fenced blocks with a language tag."
+
+  # -v / --verbose: a bit more depth, still concise.
+  if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
+    shift
+    sys="You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Use markdown; wrap code in fenced blocks with a language tag."
+  fi
+
+  llm -m claude-haiku-4.5 -s "$sys" "$*"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
