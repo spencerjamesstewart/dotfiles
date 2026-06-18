@@ -49,3 +49,16 @@ scan2pdf() {
   rm -rf "$tmp"
   echo "Created $out"
 }
+
+# ia: open files in iA Writer (which ships no CLI of its own).
+# Usage: ia notes.md            (open a file)
+#        ia draft.md ideas.md   (open several)
+#        ia                      (just launch iA Writer)
+# Requires: iA Writer.app.
+ia() {
+  if [[ $# -eq 0 ]]; then
+    open -a "iA Writer"
+  else
+    open -a "iA Writer" "$@"
+  fi
+}
