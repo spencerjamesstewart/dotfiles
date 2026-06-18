@@ -8,13 +8,28 @@ ask() {
   # Very terse by default.
   local sys="You are a terminal assistant. Answer in the fewest words possible. No preamble, no sign-off, no restating the question, no caveats unless essential. Use markdown only when it genuinely helps; wrap code in fenced blocks with a language tag."
 
-  # -v / --verbose: a bit more depth, still concise.
-  if [[ "$1" == "-v" || "$1" == "--verbose" ]]; then
-    shift
-    sys="You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Use markdown; wrap code in fenced blocks with a language tag."
-  fi
+  # Default model is the fast, cheap Haiku.
+  local model="claude-haiku-4.5"
 
-  llm -m claude-haiku-4.5 -s "$sys" "$*"
+  # Parse leading flags; they can be combined in any order.
+  while [[ "$1" == -* ]]; do
+    case "$1" in
+      # -v / --verbose: a bit more depth, still concise.
+      -v|--verbose)
+        sys="You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Use markdown; wrap code in fenced blocks with a language tag."
+        ;;
+      # -s: switch to the more capable Sonnet model.
+      -s)
+        model="claude-sonnet-4.5"
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+
+  llm -m "$model" -s "$sys" "$*"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
