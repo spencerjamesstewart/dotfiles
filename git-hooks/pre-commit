@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# pre-commit: block accidental dev-secret commits.
+#
+# Scans only the STAGED additions (not the whole working tree), so unstaged
+# scratch files and gitignored secrets like ~/.zshrc.local don't trip it.
+# Installed via install.sh (symlinked into .git/hooks/pre-commit).
+set -euo pipefail
+
+# Added lines in the staged diff, minus the "+++ b/file" header lines.
+added="$(git diff --cached -U0 --no-color | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
+
+# Common secret formats — the credential itself, not just a variable name.
+secret_re='sk-ant-[A-Za-z0-9_-]{20,}'                # Anthropic API key
+secret_re+='|sk-(proj-)?[A-Za-z0-9_-]{20,}'          # OpenAI API key
+secret_re+='|AKIA[0-9A-Z]{16}'                       # AWS access key id
+secret_re+='|aws_secret_access_key[[:space:]]*=[[:space:]]*[A-Za-z0-9/+]{40}'  # AWS secret
+secret_re+='|gh[pousr]_[A-Za-z0-9]{36,}'             # GitHub token (classic)
+secret_re+='|github_pat_[A-Za-z0-9_]{22,}'           # GitHub fine-grained PAT
+secret_re+='|AIza[0-9A-Za-z_-]{35}'                  # Google API key
+secret_re+='|ya29\.[0-9A-Za-z_-]+'                   # Google OAuth token
+secret_re+='|xox[baprs]-[A-Za-z0-9-]{10,}'           # Slack token
+secret_re+='|https://hooks\.slack\.com/services/[A-Za-z0-9/]+'  # Slack webhook
+secret_re+='|sk_live_[0-9A-Za-z]{16,}'               # Stripe secret key
+secret_re+='|-----BEGIN[A-Z ]*PRIVATE KEY-----'      # PEM private key block
+secret_re+='|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'  # JWT
+
+# Placeholders that are safe to commit (e.g. the zshrc.local.example template).
+placeholder_re='REPLACE_ME|EXAMPLE|YOUR_|PLACEHOLDER|xxxxxxxx|<[A-Za-z_]+>'
+
+hits="$(printf '%s\n' "$added" | grep -nE "$secret_re" | grep -viE "$placeholder_re" || true)"
+if [ -n "$hits" ]; then
+  echo ">>> ABORT: staged changes appear to contain a real secret:" >&2
+  printf '%s\n' "$hits" >&2
+  echo "    Unstage it (move the value into ~/.zshrc.local) before committing." >&2
+  exit 1
+fi
+
+# A machine-local secret file (*.local) must never be tracked.
+if git diff --cached --name-only --diff-filter=AM | grep -qE '\.local$'; then
+  echo ">>> ABORT: a .local file is staged — secrets must stay gitignored." >&2
+  exit 1
+fi
+
+exit 0
