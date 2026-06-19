@@ -20,7 +20,7 @@ ask() {
         ;;
       # -s: switch to the more capable Sonnet model.
       -s)
-        model="claude-sonnet-4.5"
+        model="claude-sonnet-4.6"
         ;;
       *)
         break
