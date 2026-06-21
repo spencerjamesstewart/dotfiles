@@ -2,6 +2,8 @@
 # Managed at: https://github.com/spencerjamesstewart/dotfiles
 # Load order matters: Homebrew first, syntax-highlighting last.
 
+export EDITOR=nvim
+
 # --- Homebrew (sets PATH for everything below; must be first) ---
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
