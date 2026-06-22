@@ -1,14 +1,18 @@
 # Shell functions
 
-# ask: one-shot question to an LLM, streamed straight to the terminal.
-# Requires: llm (with the anthropic plugin).
+# ask: one-shot question to an LLM.
+# Requires: llm (anthropic plugin); for the rendered look also python3 + mdcat.
 #
 #   ask "..."            one-shot, Sonnet 4.6 (default), very terse
 #   ask -o "..."         escalate to Opus        (--opus)
 #   ask -v "..."         fuller-but-tight answer (--verbose); composes with -o
 #
-# Answers are Markdown (raw syntax in the terminal). For an interactive,
-# Markdown-RENDERED, multi-turn REPL, use `chat` (defined below) instead.
+# In an interactive shell the answer is Markdown-RENDERED through chat's backend —
+# same look as `chat`: a model badge, a coloured gutter bar, and orange headings
+# (rendering needs the whole answer, so it buffers instead of streaming; a `…` hint
+# covers the wait). Any NON-interactive use — output piped/redirected (stdout not a
+# TTY) or a tool caller (ASK_TOOL set) — stays on the raw streaming path, byte-for-
+# byte unchanged. For a multi-turn version of the same look, use `chat` (below).
 #
 # ISOLATION — ask backs tools (e.g. the Anki "Ask" panel) and more to come.
 # ask is now purely one-shot and stateless: it has no session concept at all,
@@ -47,21 +51,31 @@ _ask_oneshot() {
 
 ask() {
   local sys="$_ASK_SYS_TERSE"
-  local model="claude-sonnet-4.6"   # default (llm alias)
+  local model="claude-sonnet-4.6"   # llm alias (for the llm CLI)
+  local api_id="claude-sonnet-4-6"  # API id (for the renderer's badge + bar colour)
 
   # Parse leading flags; combinable in any order. All are stateless, so they are
   # honored everywhere — interactive shells and tool callers alike.
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
-      -o|--opus)    model="claude-opus-4.8" ;;    # most capable
+      -o|--opus)    model="claude-opus-4.8"; api_id="claude-opus-4-8" ;;   # most capable
       *) break ;;
     esac
     shift
   done
 
-  # One-shot, stateless. Tools land here too.
-  _ask_oneshot "$model" "$sys" "$*"
+  # Interactive shell → render the answer with the chat look (badge + gutter bar +
+  # headings) via the shared backend's --render mode. Everything else — a tool
+  # (ASK_TOOL set) or piped/redirected output (stdout not a TTY) — falls through to
+  # the raw, streaming one-shot path untouched, so tool callers and pipelines are
+  # unaffected. (Piping into --render naturally buffers the full answer first.)
+  if [[ -t 1 && -z "$ASK_TOOL" && -f "$_CHAT_BACKEND" ]] && command -v python3 >/dev/null 2>&1; then
+    _ask_oneshot "$model" "$sys" "$*" \
+      | python3 "$_CHAT_BACKEND" --render --model "$api_id"
+  else
+    _ask_oneshot "$model" "$sys" "$*"   # raw, stateless — tools/pipes land here
+  fi
 }
 
 # chat: interactive, multi-turn LLM REPL with Markdown-RENDERED replies — the

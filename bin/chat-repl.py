@@ -270,15 +270,40 @@ def compose_in_editor(seed=""):
 def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--model", required=True)
-    p.add_argument("--system", required=True)
+    p.add_argument("--system")                       # required for the REPL only
+    p.add_argument("--render", action="store_true",  # one-shot pipe mode for `ask`
+                   help="render Markdown from stdin (with badge/bar) and exit")
     args = p.parse_args()
+
+    label = MODEL_LABELS.get(args.model, args.model)
+    chip_sgr, bar_fg = ACCENTS.get(args.model, DEFAULT_ACCENT)
+    bar = f"\033[{bar_fg}m{GUTTER}\033[0m" if sys.stdout.isatty() else None
+
+    # --render: the one-shot path for `ask`. Read the whole answer from stdin (it's
+    # already generated — no API key or system prompt needed) and give it the same
+    # model badge + gutter bar + restyled headings a chat reply gets, then exit. The
+    # `…` hint covers the wait while the upstream `llm` is still streaming into us.
+    if args.render:
+        _hint_on()
+        text = sys.stdin.read()
+        _hint_off()
+        text = text.strip("\n")
+        if not text:
+            return 0
+        if sys.stdout.isatty():
+            print(_chip(label, chip_sgr))
+        render(text, bar)
+        return 0
+
+    if not args.system:
+        print("chat: --system is required for the REPL.", file=sys.stderr)
+        return 2
 
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
         print("chat: no ANTHROPIC_API_KEY in the environment.", file=sys.stderr)
         return 1
 
-    label = MODEL_LABELS.get(args.model, args.model)
     messages = []  # the entire conversation, re-sent each turn; in memory only.
 
     if not MDCAT:
@@ -288,11 +313,7 @@ def main():
                       "'/reset' clears · '/edit' composes in $EDITOR"),
           file=sys.stderr)
 
-    # Pick this model's accent: its chip colour and the gutter-bar colour. The bar
-    # is pre-built here (None when piped, so render() draws no gutter).
-    chip_sgr, bar_fg = ACCENTS.get(args.model, DEFAULT_ACCENT)
-    bar = f"\033[{bar_fg}m{GUTTER}\033[0m" if sys.stdout.isatty() else None
-
+    # label / chip_sgr / bar were computed at the top of main() (shared with --render).
     # Both speakers get a chip on its OWN line, then their content below: ` you `
     # above your input, ` {label} ` above the reply. The you-chip is printed directly
     # (NOT baked into the readline prompt) for a hard reason — macOS libedit mishandles
