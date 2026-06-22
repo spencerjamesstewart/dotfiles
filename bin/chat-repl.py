@@ -34,6 +34,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -99,18 +101,45 @@ def _chip(label, sgr):
     return f"\033[{sgr}m {label} \033[0m" if sys.stdout.isatty() else label
 
 
-def _hint_on():
-    """Show a faint 'working' marker (nothing prints until a reply lands)."""
-    if sys.stderr.isatty():
-        sys.stderr.write(_ansi("2", "…"))
+class _Spinner:
+    """An animated braille spinner + elapsed-seconds counter shown on stderr while
+    the main thread is blocked waiting for a reply — the network call in `chat`, or
+    stdin from `llm` in --render. A daemon thread does the animation, so it keeps
+    ticking *through* the blocking call (CPython releases the GIL during socket/stdin
+    reads). No-op when stderr isn't a TTY. Used as a context manager around the wait;
+    __exit__ stops the thread and erases the line — on success, errors, and Ctrl-C.
+    """
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, color=None):
+        self._sgr = color or "2"          # model accent colour, or faint as fallback
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _run(self):
+        start = time.monotonic()
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            elapsed = int(time.monotonic() - start)
+            sys.stderr.write(f"\r\033[{self._sgr}m{frame} {elapsed}s\033[0m\033[K")
+            sys.stderr.flush()
+            i += 1
+            self._stop.wait(0.1)          # ~10 fps; also the max stop latency
+        sys.stderr.write("\r\033[K")      # erase the spinner line on the way out
         sys.stderr.flush()
 
+    def __enter__(self):
+        if sys.stderr.isatty():
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
 
-def _hint_off():
-    """Erase the 'working' marker line."""
-    if sys.stderr.isatty():
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        return False
 
 
 def call_api(key, model, system, messages):
@@ -282,11 +311,10 @@ def main():
     # --render: the one-shot path for `ask`. Read the whole answer from stdin (it's
     # already generated — no API key or system prompt needed) and give it the same
     # model badge + gutter bar + restyled headings a chat reply gets, then exit. The
-    # `…` hint covers the wait while the upstream `llm` is still streaming into us.
+    # spinner covers the wait while the upstream `llm` is still streaming into us.
     if args.render:
-        _hint_on()
-        text = sys.stdin.read()
-        _hint_off()
+        with _Spinner(bar_fg):
+            text = sys.stdin.read()
         text = text.strip("\n")
         if not text:
             return 0
@@ -365,20 +393,19 @@ def main():
             print(f"❯{sep}{msg}")
 
         messages.append({"role": "user", "content": msg})
-        _hint_on()
         try:
-            reply = call_api(key, args.model, args.system, messages)
+            # The spinner animates on stderr while call_api blocks; the `with` stops
+            # and erases it on success, error, and Ctrl-C alike.
+            with _Spinner(bar_fg):
+                reply = call_api(key, args.model, args.system, messages)
         except RuntimeError as e:
-            _hint_off()
             messages.pop()          # drop the unanswered turn → history stays valid
             print(_ansi("2", f"chat: {e}"), file=sys.stderr)
             continue
         except KeyboardInterrupt:
-            _hint_off()
             messages.pop()
             print(_ansi("2", "cancelled."), file=sys.stderr)
             continue
-        _hint_off()
 
         messages.append({"role": "assistant", "content": reply})
         print()                              # space between your line and the reply
