@@ -1,15 +1,15 @@
 # Shell functions
 
 # ask: question to an LLM, streamed straight to the terminal.
-# Requires: llm (with the anthropic plugin).
+# Requires: llm (with the anthropic plugin); aichat for --chat (Markdown REPL).
 #
 #   ask "..."            one-shot, Haiku (fast/cheap), very terse
 #   ask -s "..."         escalate to Sonnet      (--sonnet)
 #   ask -o "..."         escalate to Opus        (--opus)
 #   ask -v "..."         fuller-but-tight answer (--verbose); composes with -s/-o
-#   ask --chat           interactive multi-turn session (terminal only)
+#   ask --chat           interactive multi-turn session, Markdown-rendered (terminal only)
 #
-# Every answer comes back as Markdown (read as raw syntax in the terminal).
+# One-shot answers are Markdown (raw syntax in the terminal); --chat renders it.
 #
 # ISOLATION — ask backs tools (e.g. the Anki "Ask" panel) and more to come.
 # A tool must NEVER start, see, join, or pollute a session. Guarantees:
@@ -19,8 +19,9 @@
 #     Tools run via a subprocess with piped stdio (no TTY) and/or set ASK_TOOL,
 #     so they can never trip it; a stray "--chat ..." from a tool is just text.
 #   * `llm -c`/`--continue` (the shared "most recent conversation" pointer that
-#     any process could clobber) appears NOWHERE. Sessions use llm chat's own
-#     in-process context. No session-state file is ever written.
+#     any process could clobber) appears NOWHERE. Sessions run in aichat as a
+#     separate process with its own in-memory history; its config sets save and
+#     save_session false, so ad-hoc chats persist no state.
 #
 # Model aliases verified against `llm models` (anthropic plugin) at build time.
 
@@ -66,14 +67,31 @@ ask() {
     shift
   done
 
-  # Session mode: hand off to llm chat's own in-process REPL. Separate process,
-  # own in-memory history, no shared pointer — invisible to every tool. Model
-  # and verbosity are fixed at launch; close with `exit`/`quit`, start fresh by
-  # running `ask --chat` again (a new process = a clean context = a cheap reset).
+  # Session mode: hand off to aichat's Markdown-rendering REPL (llm's plain-text
+  # REPL is hard to read for long replies). Separate process, own in-memory
+  # history, nothing shared with the one-shot path or any tool. Model and
+  # verbosity are fixed at launch; close with `exit`/`quit`/Ctrl-D, start fresh
+  # by running `ask --chat` again (new process = clean context = cheap reset).
+  # aichat reuses llm's Anthropic key, passed at launch via CLAUDE_API_KEY (never
+  # written to disk; config is aichat/config.yaml). Falls back to llm's REPL when
+  # aichat isn't installed.
   if (( chat )); then
     [[ "$model" == claude-opus-* ]] && \
       print -u2 "ask: heads-up — sessions re-send history each turn, so Opus gets pricey; the default or -s is cheaper for long chats."
-    llm chat -m "$model" -s "$sys"
+    if command -v aichat >/dev/null 2>&1; then
+      # Map the llm alias to aichat's model id (the real Anthropic API name).
+      local amodel
+      case "$model" in
+        claude-haiku-4.5)  amodel="claude-haiku-4-5-20251001" ;;
+        claude-sonnet-4.6) amodel="claude-sonnet-4-6" ;;
+        claude-opus-4.8)   amodel="claude-opus-4-8" ;;
+      esac
+      CLAUDE_API_KEY="${ANTHROPIC_API_KEY:-$(llm keys get anthropic 2>/dev/null)}" \
+        aichat -m "claude:$amodel" --prompt "$sys"
+    else
+      print -u2 "ask: aichat not found — using llm's plain REPL (brew install aichat for Markdown rendering)."
+      llm chat -m "$model" -s "$sys"
+    fi
     return
   fi
 
