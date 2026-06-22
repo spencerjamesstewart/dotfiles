@@ -8,3 +8,7 @@
 # Editor scratch
 *.swp
 *~
+
+# Python bytecode (e.g. from bin/chat-repl.py)
+__pycache__/
+*.pyc

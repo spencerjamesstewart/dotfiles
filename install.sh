@@ -17,12 +17,6 @@ link "$DOTFILES/zsh/zshrc" "$HOME/.zshrc"
 # every install — this keeps the guard active on every machine, not just one.
 chmod +x "$DOTFILES/git-hooks/pre-commit"
 link "$DOTFILES/git-hooks/pre-commit" "$DOTFILES/.git/hooks/pre-commit"
-# aichat config (backs `ask --chat`). Lives at the macOS default location; ln
-# needs the parent dir to exist first. Holds no secrets — the key is passed at
-# launch (see aichat/config.yaml), so it's safe to track and symlink.
-AICHAT_DIR="$HOME/Library/Application Support/aichat"
-mkdir -p "$AICHAT_DIR"
-link "$DOTFILES/aichat/config.yaml" "$AICHAT_DIR/config.yaml"
 if [ ! -e "$HOME/.zshrc.local" ]; then
   cp "$DOTFILES/zsh/zshrc.local.example" "$HOME/.zshrc.local"
   echo "Created ~/.zshrc.local — add your real secrets there (it is gitignored)."

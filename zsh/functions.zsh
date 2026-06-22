@@ -1,35 +1,41 @@
 # Shell functions
 
-# ask: question to an LLM, streamed straight to the terminal.
-# Requires: llm (with the anthropic plugin); aichat for --chat (Markdown REPL).
+# ask: one-shot question to an LLM, streamed straight to the terminal.
+# Requires: llm (with the anthropic plugin).
 #
 #   ask "..."            one-shot, Haiku (fast/cheap), very terse
 #   ask -s "..."         escalate to Sonnet      (--sonnet)
 #   ask -o "..."         escalate to Opus        (--opus)
 #   ask -v "..."         fuller-but-tight answer (--verbose); composes with -s/-o
-#   ask --chat           interactive multi-turn session, Markdown-rendered (terminal only)
 #
-# One-shot answers are Markdown (raw syntax in the terminal); --chat renders it.
+# Answers are Markdown (raw syntax in the terminal). For an interactive,
+# Markdown-RENDERED, multi-turn REPL, use `chat` (defined below) instead.
 #
 # ISOLATION — ask backs tools (e.g. the Anki "Ask" panel) and more to come.
-# A tool must NEVER start, see, join, or pollute a session. Guarantees:
+# ask is now purely one-shot and stateless: it has no session concept at all,
+# so there is nothing for a tool to start, see, join, or pollute. Guarantees:
 #   * _ask_oneshot is a stateless query core with zero session logic. Tools
-#     call this (or plain `ask`, which routes here when non-interactive).
-#   * --chat is only RECOGNIZED from an interactive TTY with ASK_TOOL unset.
-#     Tools run via a subprocess with piped stdio (no TTY) and/or set ASK_TOOL,
-#     so they can never trip it; a stray "--chat ..." from a tool is just text.
-#   * `llm -c`/`--continue` (the shared "most recent conversation" pointer that
-#     any process could clobber) appears NOWHERE. Sessions run in aichat as a
-#     separate process with its own in-memory history; its config sets save and
-#     save_session false, so ad-hoc chats persist no state.
+#     call it directly, or call plain `ask` — which is just flag-parsing + that.
+#   * No shared or persistent conversation state exists on this path: no
+#     `llm -c`/`--continue` "most recent conversation" pointer (which any
+#     process could clobber), and nothing on disk. Multi-turn lives entirely in
+#     `chat`, a separate, interactive-only process with in-memory history.
 #
 # Model aliases verified against `llm models` (anthropic plugin) at build time.
 
-# Shared system prompts — single source of truth; the one-shot path and the
-# session path reuse these verbatim, so there is no copy-paste drift. Both
-# always request Markdown; the terse one stays tight so short replies don't bloat.
+# Shared system prompts — single source of truth; the one-shot path (`ask`) and
+# the REPL (`chat`) reuse these verbatim, so there is no copy-paste drift. `chat`
+# passes the chosen one into its Python backend via --system, so the text is
+# never duplicated outside this file. Both always request Markdown; the terse
+# one stays tight so short replies don't bloat.
 _ASK_SYS_TERSE='You are a terminal assistant. Answer in the fewest words possible. No preamble, no sign-off, no restating the question, no caveats unless essential. Always format the answer as Markdown, even one-liners; wrap code in fenced blocks with a language tag.'
 _ASK_SYS_VERBOSE='You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Always format the answer as Markdown; wrap code in fenced blocks with a language tag.'
+
+# Absolute path to chat's Python backend, resolved from THIS file's own location
+# (the same idiom zshrc uses to find the repo) so `chat` works regardless of
+# whether $DOTFILES is set. functions.zsh lives in zsh/, so the repo root is two
+# directories up; the backend lives in bin/.
+_CHAT_BACKEND="${${(%):-%x}:A:h:h}/bin/chat-repl.py"
 
 # _ask_oneshot: the stateless core. Knows nothing about sessions — bare `llm`
 # with an explicit model + system prompt. This is what tools call directly,
@@ -42,61 +48,83 @@ _ask_oneshot() {
 
 ask() {
   local sys="$_ASK_SYS_TERSE"
-  local model="claude-haiku-4.5"   # fast, cheap default
-  local chat=0
+  local model="claude-haiku-4.5"   # fast, cheap default (llm alias)
 
-  # May we run session ops? Only from an interactive terminal with no tool
-  # sentinel. `llm chat` needs a TTY anyway; this turns "no TTY / is a tool"
-  # into a hard, explicit guard so a tool can never open a session.
-  local interactive=0
-  [[ -t 0 && -t 1 && -z "$ASK_TOOL" ]] && interactive=1
-
-  # Parse leading flags; combinable in any order.
+  # Parse leading flags; combinable in any order. All are stateless, so they are
+  # honored everywhere — interactive shells and tool callers alike.
   while [[ "$1" == -* ]]; do
     case "$1" in
-      # Stateless flags — honored anywhere (tools included).
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
       -s|--sonnet)  model="claude-sonnet-4.6" ;;  # more capable
       -o|--opus)    model="claude-opus-4.8" ;;    # most capable; last of -s/-o wins
-      # Stateful flag — a session trigger ONLY in the interactive context.
-      # From a tool / non-TTY, stop parsing so it's treated as plain prompt text
-      # and the query runs one-shot. (Never opens a session.)
-      --chat) (( interactive )) && { chat=1; shift; }; break ;;
       *) break ;;
     esac
     shift
   done
 
-  # Session mode: hand off to aichat's Markdown-rendering REPL (llm's plain-text
-  # REPL is hard to read for long replies). Separate process, own in-memory
-  # history, nothing shared with the one-shot path or any tool. Model and
-  # verbosity are fixed at launch; close with `exit`/`quit`/Ctrl-D, start fresh
-  # by running `ask --chat` again (new process = clean context = cheap reset).
-  # aichat reuses llm's Anthropic key, passed at launch via CLAUDE_API_KEY (never
-  # written to disk; config is aichat/config.yaml). Falls back to llm's REPL when
-  # aichat isn't installed.
-  if (( chat )); then
-    [[ "$model" == claude-opus-* ]] && \
-      print -u2 "ask: heads-up — sessions re-send history each turn, so Opus gets pricey; the default or -s is cheaper for long chats."
-    if command -v aichat >/dev/null 2>&1; then
-      # Map the llm alias to aichat's model id (the real Anthropic API name).
-      local amodel
-      case "$model" in
-        claude-haiku-4.5)  amodel="claude-haiku-4-5-20251001" ;;
-        claude-sonnet-4.6) amodel="claude-sonnet-4-6" ;;
-        claude-opus-4.8)   amodel="claude-opus-4-8" ;;
-      esac
-      CLAUDE_API_KEY="${ANTHROPIC_API_KEY:-$(llm keys get anthropic 2>/dev/null)}" \
-        aichat -m "claude:$amodel" --prompt "$sys"
-    else
-      print -u2 "ask: aichat not found — using llm's plain REPL (brew install aichat for Markdown rendering)."
-      llm chat -m "$model" -s "$sys"
-    fi
-    return
-  fi
-
   # One-shot, stateless. Tools land here too.
   _ask_oneshot "$model" "$sys" "$*"
+}
+
+# chat: interactive, multi-turn LLM REPL with Markdown-RENDERED replies — the
+# readable counterpart to ask's raw one-shot output.
+# Requires: python3 + mdcat. Reuses ask's shared prompts and Anthropic key.
+#
+#   chat            multi-turn, Haiku (fast/cheap), terse
+#   chat -s         escalate to Sonnet      (--sonnet)
+#   chat -o         escalate to Opus        (--opus)
+#   chat -v         fuller-but-tight answers (--verbose); composes with -s/-o
+#
+# Model + verbosity are fixed at launch (mirroring ask's flags). In the REPL:
+# `/reset` wipes the context; `exit`/`quit`/Ctrl-D leave. Nothing is written to
+# disk, so relaunching is a clean reset. The backend holds history in memory and
+# re-sends it each turn (so Opus gets pricey on long chats — see the heads-up).
+#
+# ISOLATION — like ask, chat must never be startable by a tool, so it is
+# interactive-ONLY: it refuses unless stdin+stdout are a TTY and ASK_TOOL is
+# unset. The backend (bin/chat-repl.py) is a separate process holding its own
+# in-memory history; it shares nothing with the one-shot path. The Anthropic key
+# is passed via the environment (never argv, which `ps` can see; never to disk).
+chat() {
+  # Hard interactive guard — a tool (no TTY and/or ASK_TOOL set) can never reach
+  # the REPL; it should be using one-shot `ask` instead.
+  [[ -t 0 && -t 1 && -z "$ASK_TOOL" ]] || {
+    print -u2 "chat: interactive use only — tools should call \`ask\` (one-shot)."
+    return 1
+  }
+
+  local sys="$_ASK_SYS_TERSE"
+  # Real Anthropic API ids (NOT llm aliases): the backend calls the Messages API
+  # directly. Verified against `llm models`; the same ids the aliases resolve to.
+  local model="claude-haiku-4-5-20251001"   # fast, cheap default
+
+  while [[ "$1" == -* ]]; do
+    case "$1" in
+      -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
+      -s|--sonnet)  model="claude-sonnet-4-6" ;;  # more capable
+      -o|--opus)    model="claude-opus-4-8" ;;    # most capable; last of -s/-o wins
+      *) break ;;
+    esac
+    shift
+  done
+
+  [[ "$model" == claude-opus-* ]] && \
+    print -u2 "chat: heads-up — every turn re-sends the whole history, so Opus gets pricey; the default or -s is cheaper for long chats."
+
+  # Reuse llm's stored Anthropic key (an explicit env override wins). Resolved
+  # here and handed to the backend via the environment only.
+  local key="${ANTHROPIC_API_KEY:-$(llm keys get anthropic 2>/dev/null)}"
+  [[ -n "$key" ]] || {
+    print -u2 "chat: no Anthropic key — set ANTHROPIC_API_KEY or run \`llm keys set anthropic\`."
+    return 1
+  }
+
+  [[ -f "$_CHAT_BACKEND" ]] || {
+    print -u2 "chat: backend not found at $_CHAT_BACKEND"
+    return 1
+  }
+
+  ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" --model "$model" --system "$sys"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
