@@ -17,6 +17,10 @@ Design / isolation notes (mirroring the framing in functions.zsh):
   * Single source of truth for prompts. The system prompt arrives via --system
     (the shared _ASK_SYS_* strings defined in the shell); it is never copied
     here, so there is no drift.
+  * Multi-line input via the editor. libedit (the macOS readline) has no
+    bracketed-paste support, so a pasted block submits line by line. `/edit`
+    opens $EDITOR to compose or paste a whole message instead (see
+    compose_in_editor); the buffer comes back as one turn.
   * The API key arrives via the ANTHROPIC_API_KEY env var, never on argv (which
     `ps` can see) and never on disk; we read it once and keep it in memory.
 """
@@ -24,9 +28,11 @@ Design / isolation notes (mirroring the framing in functions.zsh):
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -140,6 +146,43 @@ def render(text):
         print(text)  # never let a render hiccup kill the turn
 
 
+def compose_in_editor(seed=""):
+    """Open $VISUAL/$EDITOR on a temp file and return its contents, stripped.
+
+    This is the escape hatch for multi-line input: libedit (the macOS readline)
+    has no bracketed-paste support, so pasting a block into the prompt submits it
+    line by line. Composing in a real editor sidesteps that entirely — paste,
+    edit, save, quit, and the whole buffer comes back as one message.
+
+    Returns the edited text (may be ""), or None if the editor couldn't launch
+    or exited non-zero (e.g. vim `:cq`), which we treat as "cancel, send nothing"
+    — the same convention git uses for its commit editor. The editor inherits the
+    terminal, so full-screen editors (nvim, vim) take over and restore normally.
+    """
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    fd, path = tempfile.mkstemp(prefix="chat-", suffix=".md")  # .md → syntax hl
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(seed)
+        try:
+            proc = subprocess.run([*shlex.split(editor), path], check=False)
+        except (OSError, ValueError) as e:
+            print(_ansi("2", f"chat: could not launch editor '{editor}': {e}"),
+                  file=sys.stderr)
+            return None
+        if proc.returncode != 0:
+            print(_ansi("2", f"chat: editor exited {proc.returncode} — cancelled."),
+                  file=sys.stderr)
+            return None
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--model", required=True)
@@ -158,7 +201,8 @@ def main():
         print("chat: mdcat not found — printing raw Markdown "
               "(brew install mdcat to render).", file=sys.stderr)
     print(_ansi("2", f"chat · {label} · 'exit'/'quit'/Ctrl-D to leave · "
-                      "'/reset' clears context"), file=sys.stderr)
+                      "'/reset' clears · '/edit' composes in $EDITOR"),
+          file=sys.stderr)
 
     # Coloured prompt; the \001..\002 markers tell readline the escape bytes are
     # non-printing, so it computes line width correctly when editing long input.
@@ -191,6 +235,19 @@ def main():
             messages.clear()
             print(_ansi("2", "context cleared."), file=sys.stderr)
             continue
+        if msg == "/edit" or msg.startswith("/edit "):
+            # Anything after "/edit " seeds the buffer (e.g. "/edit fix this:").
+            edited = compose_in_editor(msg[6:] if msg[5:6] == " " else "")
+            if edited is None:          # launch failed / cancelled (reason shown)
+                continue
+            msg = edited
+            if not msg:
+                print(_ansi("2", "empty — nothing sent."), file=sys.stderr)
+                continue
+            # The editor took over the screen, so echo the composed prompt to the
+            # transcript; otherwise the reply would appear with no visible question.
+            sep = "\n" if "\n" in msg else " "
+            print(f"{label} ❯{sep}{msg}")
 
         messages.append({"role": "user", "content": msg})
         _hint_on()
