@@ -162,12 +162,17 @@ def main():
 
     # Coloured prompt; the \001..\002 markers tell readline the escape bytes are
     # non-printing, so it computes line width correctly when editing long input.
+    # Keep the prompt a SINGLE line: a leading "\n" inside the prompt corrupts
+    # libedit's (macOS) row/column model and garbles editing at the right margin
+    # (cursor drift, backspace desync). The blank line between turns is printed
+    # separately, at the top of the loop, so it never reaches readline.
     if sys.stdout.isatty():
-        prompt = f"\n\001\033[1;36m\002{label} ❯ \001\033[0m\002"
+        prompt = f"\001\033[1;36m\002{label} ❯ \001\033[0m\002"
     else:
-        prompt = f"\n{label} ❯ "
+        prompt = f"{label} ❯ "
 
     while True:
+        print()                     # turn separator — NOT part of the prompt
         try:
             line = input(prompt)
         except EOFError:            # Ctrl-D
