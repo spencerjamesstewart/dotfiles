@@ -47,11 +47,19 @@ MODEL_LABELS = {
 }
 
 # mdcat invocation: render Markdown read from stdin (`-`); `--local` so a reply
-# can't make us fetch arbitrary remote image URLs; `--no-pager` because a REPL
-# must never block in a pager between turns (it is mdcat's default anyway, but
-# we are explicit). mdcat auto-detects terminal width and colour.
+# can't make us fetch arbitrary remote image URLs. `--paginate` routes the
+# rendered output through MDCAT_PAGER (below). mdcat auto-detects terminal width
+# and colour.
 MDCAT = shutil.which("mdcat")
-MDCAT_ARGS = ["--local", "--no-pager", "-"]
+MDCAT_ARGS = ["--local", "--paginate", "-"]
+
+# Pager for mdcat. `less -F` quits immediately when a reply fits the current pane,
+# so the REPL never blocks on normal-length answers; only a reply taller than the
+# pane opens in less (top-anchored, `q` to continue) instead of being dumped and
+# leaving you scrolled to the bottom. Sizing is per-pane (less reads its own tty),
+# so splits of any size just work. `-R` preserves mdcat's ANSI colour; `-X` skips
+# the alternate screen so rendered replies stay in the scrollback.
+MDCAT_PAGER = "less -RFX"
 
 
 def _ansi(code, s):
@@ -125,7 +133,9 @@ def render(text):
         print(text)
         return
     try:
-        subprocess.run([MDCAT, *MDCAT_ARGS], input=text, text=True, check=False)
+        env = {**os.environ, "MDCAT_PAGER": MDCAT_PAGER}
+        subprocess.run([MDCAT, *MDCAT_ARGS], input=text, text=True,
+                       check=False, env=env)
     except Exception:
         print(text)  # never let a render hiccup kill the turn
 
