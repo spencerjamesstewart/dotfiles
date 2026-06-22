@@ -28,6 +28,7 @@ Design / isolation notes (mirroring the framing in functions.zsh):
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -46,31 +47,56 @@ API_VERSION = "2023-06-01"
 MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
-# Friendly labels for the prompt line; falls back to the raw id if unmapped.
+# Friendly labels for the chips/prompt; falls back to the raw id if unmapped.
 MODEL_LABELS = {
     "claude-sonnet-4-6": "sonnet",
     "claude-opus-4-8": "opus",
 }
 
-# mdcat invocation: render Markdown read from stdin (`-`); `--local` so a reply
-# can't make us fetch arbitrary remote image URLs. `--paginate` routes the
-# rendered output through MDCAT_PAGER (below). mdcat auto-detects terminal width
-# and colour.
-MDCAT = shutil.which("mdcat")
-MDCAT_ARGS = ["--local", "--paginate", "-"]
+# Per-turn styling. Each speaker gets a reverse-video "chip" — a padded label on a
+# coloured background — so it's unmistakable who is talking; the assistant's reply
+# is additionally bracketed by a coloured gutter bar down its left edge, so the
+# block visibly starts and ends with the bar (the whole point: no more hunting for
+# where a reply begins/ends). Colours are plain SGR codes from the 16-colour
+# palette, so they track the terminal's own theme. Styling is emitted ONLY when
+# stdout is a TTY (see _chip / render); piped output stays plain text.
+YOU_SGR = "1;97;42"     # your turn: bold white on green
+GUTTER = "▌"            # the bar glyph; one cell + one space = a 2-col gutter
 
-# Pager for mdcat. `less -F` quits immediately when a reply fits the current pane,
-# so the REPL never blocks on normal-length answers; only a reply taller than the
-# pane opens in less (top-anchored, `q` to continue) instead of being dumped and
-# leaving you scrolled to the bottom. Sizing is per-pane (less reads its own tty),
-# so splits of any size just work. `-R` preserves mdcat's ANSI colour; `-X` skips
-# the alternate screen so rendered replies stay in the scrollback.
-MDCAT_PAGER = "less -RFX"
+# model id → (chip SGR, gutter-bar fg). Magenta = opus, blue = sonnet; both are
+# distinct from your green chip so human and assistant never blur together. The
+# fallback covers any unlisted model.
+ACCENTS = {
+    "claude-opus-4-8":   ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
+    "claude-sonnet-4-6": ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
+}
+DEFAULT_ACCENT = ("1;97;45", "95")
+
+# mdcat invocation: render Markdown read from stdin (`-`); `--local` so a reply
+# can't make us fetch arbitrary remote image URLs. `--columns` reserves room for
+# the 2-col gutter so wrapped lines never overflow. We CAPTURE mdcat's output
+# (rather than letting it `--paginate`) so we can draw the gutter bar ourselves,
+# then page the barred block through `less -RFX` (see render/_page).
+MDCAT = shutil.which("mdcat")
+
+# Heading restyle. A terminal can't resize text, so mdcat signals heading LEVEL with
+# a run of ┄ glyphs (U+2504) — visually noisy "dots". We rebuild headings instead:
+# `#`×level + UPPERCASE text, in bold Gruvbox bright orange (#fe8019). Orange is the
+# one warm Gruvbox accent not already used by the green/blue/magenta speaker chips or
+# the yellow links/rules, and it has strong contrast on the #282828 background. ┄ is
+# heading-specific (code fences/tables use U+2500), so matching on it is safe.
+HEAD_DASH = "┄"                       # U+2504 — mdcat's heading-level marker
+HEAD_SGR = "1;38;2;254;128;25"        # bold + Gruvbox bright orange (truecolor)
 
 
 def _ansi(code, s):
     """Wrap s in an ANSI SGR code, but only when stderr is a real terminal."""
     return f"\033[{code}m{s}\033[0m" if sys.stderr.isatty() else s
+
+
+def _chip(label, sgr):
+    """A padded, coloured badge ` label ` — only on a TTY; plain text otherwise."""
+    return f"\033[{sgr}m {label} \033[0m" if sys.stdout.isatty() else label
 
 
 def _hint_on():
@@ -133,17 +159,75 @@ def call_api(key, model, system, messages):
     return text or _ansi("2", "[empty response]")
 
 
-def render(text):
-    """Pipe text through mdcat; print raw if mdcat is missing or errors."""
-    if not MDCAT:
-        print(text)
-        return
-    try:
-        env = {**os.environ, "MDCAT_PAGER": MDCAT_PAGER}
-        subprocess.run([MDCAT, *MDCAT_ARGS], input=text, text=True,
-                       check=False, env=env)
-    except Exception:
-        print(text)  # never let a render hiccup kill the turn
+def _restyle_headings(text):
+    """Rebuild mdcat's ┄-run headings as `#`×level + UPPERCASE in our accent colour.
+
+    mdcat encodes heading level as N copies of ┄ (U+2504); we count them, drop
+    mdcat's own (too-dark, sonnet-clashing) heading colour, and re-emit the line as
+    `#`×level + the heading text uppercased, in bold orange. Only ┄-bearing lines are
+    touched, so code fences (U+2500) and tables are untouched. Inline styling inside
+    a heading is flattened to plain caps — a fine trade for headings.
+    """
+    if HEAD_DASH not in text:
+        return text
+    out = []
+    for line in text.split("\n"):
+        if HEAD_DASH not in line:
+            out.append(line)
+            continue
+        level = line.count(HEAD_DASH)
+        # Strip all ANSI and the ┄ run to recover the bare heading text.
+        plain = re.sub(r"\033\[[0-9;]*m", "", line).replace(HEAD_DASH, "").strip()
+        out.append(f"\033[{HEAD_SGR}m{'#' * level} {plain.upper()}\033[0m")
+    return "\n".join(out)
+
+
+def render(text, bar):
+    """Render Markdown via mdcat, draw a gutter bar down the left, then page it.
+
+    `bar` is the pre-coloured gutter string (e.g. a magenta ▌), or None when stdout
+    isn't a TTY — in which case we skip the gutter and the pager and just print. Any
+    mdcat/render hiccup falls back to the raw text, so a turn never dies on a
+    formatting error.
+    """
+    out = text
+    if MDCAT:
+        cols = shutil.get_terminal_size((80, 24)).columns
+        width = max(20, cols - 2)        # leave 2 cols for the "▌ " gutter
+        try:
+            # CLICOLOR_FORCE keeps mdcat's ANSI colour on through the capture pipe
+            # (it would otherwise be free to drop colour when stdout isn't a tty).
+            env = {**os.environ, "CLICOLOR_FORCE": "1"}
+            proc = subprocess.run(
+                [MDCAT, "--local", "--columns", str(width), "-"],
+                input=text, text=True, capture_output=True, check=False, env=env,
+            )
+            if proc.returncode == 0:
+                out = proc.stdout
+        except Exception:
+            pass                          # keep the raw text
+    out = _restyle_headings(out)          # ┄-run headings → `#`×level UPPERCASE orange
+    if bar:
+        # Prefix EVERY line (blanks included) so the bar is one continuous gutter.
+        out = "\n".join(f"{bar} {line}" for line in out.splitlines())
+    _page(out)
+
+
+def _page(text):
+    """Show text through `less -RFX` on a TTY, else just print.
+
+    `-R` preserves the ANSI colour, `-F` quits immediately when the reply fits the
+    pane (so the REPL never blocks on short answers), `-X` skips the alternate
+    screen so the rendered reply stays in the scrollback. less reads keystrokes from
+    its own /dev/tty even though we feed it via a pipe, so paging still works.
+    """
+    if sys.stdout.isatty():
+        try:
+            subprocess.run(["less", "-RFX"], input=text, text=True, check=False)
+            return
+        except Exception:
+            pass                          # fall through to a plain dump
+    print(text)
 
 
 def compose_in_editor(seed=""):
@@ -204,19 +288,28 @@ def main():
                       "'/reset' clears · '/edit' composes in $EDITOR"),
           file=sys.stderr)
 
-    # Coloured prompt; the \001..\002 markers tell readline the escape bytes are
-    # non-printing, so it computes line width correctly when editing long input.
-    # Keep the prompt a SINGLE line: a leading "\n" inside the prompt corrupts
-    # libedit's (macOS) row/column model and garbles editing at the right margin
-    # (cursor drift, backspace desync). The blank line between turns is printed
-    # separately, at the top of the loop, so it never reaches readline.
-    if sys.stdout.isatty():
-        prompt = f"\001\033[1;36m\002{label} ❯ \001\033[0m\002"
-    else:
-        prompt = f"{label} ❯ "
+    # Pick this model's accent: its chip colour and the gutter-bar colour. The bar
+    # is pre-built here (None when piped, so render() draws no gutter).
+    chip_sgr, bar_fg = ACCENTS.get(args.model, DEFAULT_ACCENT)
+    bar = f"\033[{bar_fg}m{GUTTER}\033[0m" if sys.stdout.isatty() else None
+
+    # Both speakers get a chip on its OWN line, then their content below: ` you `
+    # above your input, ` {label} ` above the reply. The you-chip is printed directly
+    # (NOT baked into the readline prompt) for a hard reason — macOS libedit mishandles
+    # the \001..\002 "non-printing" markers used to colour a prompt: it hoists the
+    # bracketed escapes to the front, so a trailing reset lands BEFORE the label and
+    # strips its styling (the old colour-in-prompt never actually rendered). Dropping
+    # the markers fixes the colour but then libedit counts the escape bytes as width
+    # and the cursor drifts on long/wrapping lines. Sidestepping both: the chip is a
+    # plain print() (background renders correctly) and the readline prompt is a bare,
+    # escape-free "❯ ", so its width is exact and editing stays precise.
+    you_chip = _chip("you", YOU_SGR)
+    model_chip = _chip(label, chip_sgr)
+    prompt = "❯ "
 
     while True:
-        print()                     # turn separator — NOT part of the prompt
+        print()                     # blank turn separator
+        print(you_chip)             # ` you ` badge on its own line (bg renders here)
         try:
             line = input(prompt)
         except EOFError:            # Ctrl-D
@@ -244,10 +337,11 @@ def main():
             if not msg:
                 print(_ansi("2", "empty — nothing sent."), file=sys.stderr)
                 continue
-            # The editor took over the screen, so echo the composed prompt to the
-            # transcript; otherwise the reply would appear with no visible question.
+            # The editor took over the screen; echo the composed message (under the
+            # ` you ` badge already printed above this turn) with the same "❯ " marker
+            # the live prompt uses, so the reply still has a visible question.
             sep = "\n" if "\n" in msg else " "
-            print(f"{label} ❯{sep}{msg}")
+            print(f"❯{sep}{msg}")
 
         messages.append({"role": "user", "content": msg})
         _hint_on()
@@ -266,7 +360,9 @@ def main():
         _hint_off()
 
         messages.append({"role": "assistant", "content": reply})
-        render(reply)
+        print()                              # space between your line and the reply
+        print(model_chip)                    # ` opus ` / ` sonnet ` header chip
+        render(reply, bar)
 
     return 0
 
