@@ -3,10 +3,9 @@
 # ask: one-shot question to an LLM, streamed straight to the terminal.
 # Requires: llm (with the anthropic plugin).
 #
-#   ask "..."            one-shot, Haiku (fast/cheap), very terse
-#   ask -s "..."         escalate to Sonnet      (--sonnet)
+#   ask "..."            one-shot, Sonnet 4.6 (default), very terse
 #   ask -o "..."         escalate to Opus        (--opus)
-#   ask -v "..."         fuller-but-tight answer (--verbose); composes with -s/-o
+#   ask -v "..."         fuller-but-tight answer (--verbose); composes with -o
 #
 # Answers are Markdown (raw syntax in the terminal). For an interactive,
 # Markdown-RENDERED, multi-turn REPL, use `chat` (defined below) instead.
@@ -39,7 +38,7 @@ _CHAT_BACKEND="${${(%):-%x}:A:h:h}/bin/chat-repl.py"
 
 # _ask_oneshot: the stateless core. Knows nothing about sessions — bare `llm`
 # with an explicit model + system prompt. This is what tools call directly,
-# e.g.  ASK_TOOL=anki-ask _ask_oneshot claude-haiku-4.5 "$sys" "the prompt"
+# e.g.  ASK_TOOL=anki-ask _ask_oneshot claude-sonnet-4.6 "$sys" "the prompt"
 # Usage: _ask_oneshot <model> <system-prompt> <prompt...>
 _ask_oneshot() {
   local model="$1" sys="$2"; shift 2
@@ -48,15 +47,14 @@ _ask_oneshot() {
 
 ask() {
   local sys="$_ASK_SYS_TERSE"
-  local model="claude-haiku-4.5"   # fast, cheap default (llm alias)
+  local model="claude-sonnet-4.6"   # default (llm alias)
 
   # Parse leading flags; combinable in any order. All are stateless, so they are
   # honored everywhere — interactive shells and tool callers alike.
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
-      -s|--sonnet)  model="claude-sonnet-4.6" ;;  # more capable
-      -o|--opus)    model="claude-opus-4.8" ;;    # most capable; last of -s/-o wins
+      -o|--opus)    model="claude-opus-4.8" ;;    # most capable
       *) break ;;
     esac
     shift
@@ -70,10 +68,9 @@ ask() {
 # readable counterpart to ask's raw one-shot output.
 # Requires: python3 + mdcat. Reuses ask's shared prompts and Anthropic key.
 #
-#   chat            multi-turn, Haiku (fast/cheap), terse
-#   chat -s         escalate to Sonnet      (--sonnet)
+#   chat            multi-turn, Sonnet 4.6 (default), terse
 #   chat -o         escalate to Opus        (--opus)
-#   chat -v         fuller-but-tight answers (--verbose); composes with -s/-o
+#   chat -v         fuller-but-tight answers (--verbose); composes with -o
 #
 # Model + verbosity are fixed at launch (mirroring ask's flags). In the REPL:
 # `/reset` wipes the context; `exit`/`quit`/Ctrl-D leave. Nothing is written to
@@ -96,20 +93,19 @@ chat() {
   local sys="$_ASK_SYS_TERSE"
   # Real Anthropic API ids (NOT llm aliases): the backend calls the Messages API
   # directly. Verified against `llm models`; the same ids the aliases resolve to.
-  local model="claude-haiku-4-5-20251001"   # fast, cheap default
+  local model="claude-sonnet-4-6"   # default
 
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
-      -s|--sonnet)  model="claude-sonnet-4-6" ;;  # more capable
-      -o|--opus)    model="claude-opus-4-8" ;;    # most capable; last of -s/-o wins
+      -o|--opus)    model="claude-opus-4-8" ;;    # most capable
       *) break ;;
     esac
     shift
   done
 
   [[ "$model" == claude-opus-* ]] && \
-    print -u2 "chat: heads-up — every turn re-sends the whole history, so Opus gets pricey; the default or -s is cheaper for long chats."
+    print -u2 "chat: heads-up — every turn re-sends the whole history, so Opus gets pricey; the default (Sonnet) is cheaper for long chats."
 
   # Reuse llm's stored Anthropic key (an explicit env override wins). Resolved
   # here and handed to the backend via the environment only.

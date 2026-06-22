@@ -42,7 +42,6 @@ TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
 # Friendly labels for the prompt line; falls back to the raw id if unmapped.
 MODEL_LABELS = {
-    "claude-haiku-4-5-20251001": "haiku",
     "claude-sonnet-4-6": "sonnet",
     "claude-opus-4-8": "opus",
 }
