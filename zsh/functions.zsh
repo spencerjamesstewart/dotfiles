@@ -110,11 +110,19 @@ ask() {
 #   chat            multi-turn, Sonnet 5 (default), terse
 #   chat -f         escalate to Fable 5     (--fable, most capable)
 #   chat -v         fuller-but-tight answers (--verbose); composes with -f
+#   chat --no-compact           keep the whole history; disable auto-compaction
+#   chat --compact-threshold N  auto-compact once effective input ≥ N tokens (default 8000)
 #
 # Model + verbosity are fixed at launch (mirroring ask's flags). In the REPL:
-# `/reset` wipes the context; `exit`/`quit`/Ctrl-D leave. Nothing is written to
-# disk, so relaunching is a clean reset. The backend holds history in memory and
-# re-sends it each turn (so Opus gets pricey on long chats — see the heads-up).
+# `/reset` wipes the context; `/edit` composes in $EDITOR; `/compact` summarizes
+# older turns now; `/usage` prints the last turn's token counts; `exit`/`quit`/
+# Ctrl-D leave. Nothing is written to disk, so relaunching is a clean reset.
+#
+# The backend holds history in memory and re-sends it each turn, but marks the
+# re-sent prefix cacheable (cache-read billing, ~10% of input price) and
+# auto-compacts older turns into a Haiku-written summary once the context crosses
+# the threshold — so long chats stay cheap. Fable still costs more per token than
+# the default (see the heads-up).
 #
 # ISOLATION — like ask, chat must never be startable by a tool, so it is
 # interactive-ONLY: it refuses unless stdin+stdout are a TTY and ASK_TOOL is
@@ -132,18 +140,27 @@ chat() {
   local sys="$_ASK_SYS_TERSE"
   # Real Anthropic API ids: the backend calls the Messages API directly.
   local model="claude-sonnet-5"   # default: balanced speed + intelligence
+  local -a compact_args           # compaction flags forwarded to the backend
 
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
       -f|--fable)   model="claude-fable-5" ;;    # escalate to the most capable
+      --no-compact) compact_args+=(--no-compact) ;;   # off by request; no short form
+      --compact-threshold)
+        shift
+        [[ "$1" == <-> ]] || {   # zsh glob for an integer; catches missing/non-numeric
+          print -u2 "chat: --compact-threshold needs an integer token count."
+          return 1
+        }
+        compact_args+=(--compact-threshold "$1") ;;
       *) break ;;
     esac
     shift
   done
 
   [[ "$model" != claude-sonnet-5 ]] && \
-    print -u2 "chat: heads-up — every turn re-sends the whole history, so Fable gets pricey; the default (Sonnet) is cheaper for long chats."
+    print -u2 "chat: heads-up — Fable costs more per token than the default (Sonnet); prompt caching + auto-compaction soften long-chat cost, but Sonnet is still cheaper."
 
   # Resolve the key (env override, else the key file) and hand it to the backend
   # via the environment only — never argv (which `ps` can see) or disk.
@@ -158,7 +175,8 @@ chat() {
     return 1
   }
 
-  ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" --model "$model" --system "$sys"
+  ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
+    --model "$model" --system "$sys" "${compact_args[@]}"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.

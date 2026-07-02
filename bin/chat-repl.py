@@ -49,6 +49,23 @@ API_VERSION = "2023-06-01"
 MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
+# Auto-compaction (REPL only). When the effective prompt size crosses the
+# threshold, older turns are summarized by a cheap Haiku one-shot into a single
+# synthetic exchange, keeping the recent tail intact. On by default; the
+# `--no-compact` flag disables only the automatic trigger (manual `/compact`
+# still works). The summarizer prompt lives HERE, not in functions.zsh — it's an
+# internal implementation detail, not one of the user-facing _ASK_SYS_* prompts.
+COMPACT_MODEL = "claude-haiku-4-5"     # cheap + fast; summaries don't need Sonnet
+COMPACT_MAX_TOKENS = 600
+DEFAULT_COMPACT_THRESHOLD = 8000       # effective input tokens (see main loop)
+SUMMARIZER_SYS = (
+    "Summarize this conversation transcript densely for use as context in a "
+    "continuing conversation. Preserve: established facts and definitions, "
+    "conclusions reached, the user's stated preferences or corrections, and any "
+    "open questions. Omit pleasantries and rendering artifacts. Target 300-400 "
+    "tokens. Output only the summary, no preamble."
+)
+
 # Friendly labels for the chips/prompt; falls back to the raw id if unmapped.
 MODEL_LABELS = {
     "claude-sonnet-5": "sonnet",
@@ -146,13 +163,42 @@ class _Spinner:
         return False
 
 
-def call_api(key, model, system, messages):
-    """POST the whole conversation and return the assistant's text.
+def _with_cache_breakpoint(messages):
+    """Return a copy of `messages` with an ephemeral cache_control breakpoint on
+    the last content block of the LAST message.
 
-    Raises RuntimeError with a human-readable message on any API/network error;
-    the caller keeps the REPL alive and leaves history untouched.
+    History is stored clean (plain string content); the marker is attached only
+    here, at send time, so exactly one breakpoint ever exists and it always rides
+    the newest turn. Everything up to and including it — system prompt + all prior
+    turns — becomes the cacheable prefix, billed at the cache-read rate on repeat
+    turns. Only the last element is rebuilt into content-block form; earlier
+    string-content messages are left as-is (the API accepts the mix).
     """
-    payload = {"model": model, "max_tokens": MAX_TOKENS, "messages": messages}
+    if not messages:
+        return messages
+    out = list(messages)                 # shallow copy; we replace only the tail
+    last = out[-1]
+    content = last["content"]
+    if isinstance(content, str):         # normal case: history stores strings
+        out[-1] = {"role": last["role"], "content": [
+            {"type": "text", "text": content,
+             "cache_control": {"type": "ephemeral"}},
+        ]}
+    return out
+
+
+def call_api(key, model, system, messages, max_tokens=MAX_TOKENS, cache=False):
+    """POST the whole conversation; return (assistant_text, usage_dict).
+
+    `usage_dict` is the API's usage object (input/output/cache token counts); it
+    is `{}` if the response omits it. When `cache=True`, an ephemeral cache
+    breakpoint is placed on the final message so the re-sent prefix bills at the
+    cache-read rate. Raises RuntimeError with a human-readable message on any
+    API/network error; the caller keeps the REPL alive and leaves history intact.
+    """
+    if cache:
+        messages = _with_cache_breakpoint(messages)
+    payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
     if system:
         payload["system"] = system   # omit when empty; the API rejects a blank system
     body = json.dumps(payload).encode("utf-8")
@@ -186,8 +232,60 @@ def call_api(key, model, system, messages):
         if block.get("type") == "text"
     )
     if data.get("stop_reason") == "max_tokens":
-        text += _ansi("2", f"\n\n[truncated at {MAX_TOKENS} tokens]")
-    return text or _ansi("2", "[empty response]")
+        text += _ansi("2", f"\n\n[truncated at {max_tokens} tokens]")
+    usage = data.get("usage") or {}
+    return (text or _ansi("2", "[empty response]")), usage
+
+
+def _serialize_transcript(messages):
+    """Flatten stored messages into a plain `You:` / `Assistant:` transcript for
+    the summarizer. History is stored as string content; the block branch is
+    defensive only (in case a decorated message ever reaches here)."""
+    lines = []
+    for m in messages:
+        who = "You" if m["role"] == "user" else "Assistant"
+        content = m["content"]
+        if not isinstance(content, str):
+            content = "".join(b.get("text", "") for b in content
+                              if isinstance(b, dict))
+        lines.append(f"{who}: {content}")
+    return "\n\n".join(lines)
+
+
+def compact(key, messages, announce_skip=False):
+    """Summarize older turns into one synthetic exchange, keeping the recent tail.
+
+    Returns a NEW messages list on success, or None when it was skipped (too
+    little history) or the summary request failed — in which case history must be
+    left unchanged. Prints its own one-line notice/warning. `announce_skip` makes
+    the too-short skip say so out loud (manual `/compact`); the automatic caller
+    passes False so it stays quiet when it can't yet act.
+    """
+    # History strictly alternates user/assistant starting with user, so pairs is
+    # just half the length. Keep the last 2 exchanges (4 messages); evict the rest.
+    pairs = len(messages) // 2
+    if pairs <= 3:
+        if announce_skip:
+            print(_ansi("2", "chat: not enough history to compact."), file=sys.stderr)
+        return None
+    keep, evict = messages[-4:], messages[:-4]
+    try:
+        summary, _ = call_api(key, COMPACT_MODEL, SUMMARIZER_SYS,
+                              [{"role": "user", "content": _serialize_transcript(evict)}],
+                              max_tokens=COMPACT_MAX_TOKENS)
+    except RuntimeError as e:
+        print(_ansi("2", f"chat: compaction failed ({e}); history unchanged."),
+              file=sys.stderr)
+        return None
+    summary = re.sub(r"\033\[[0-9;]*m", "", summary).strip()   # drop any marker SGR
+    compacted = [
+        {"role": "user", "content":
+            "[Summary of earlier conversation, compacted to save context]\n" + summary},
+        {"role": "assistant", "content": "Understood — continuing from that summary."},
+    ] + keep
+    print(_ansi("2", f"[compacted: {len(evict)} turns → summary; kept last 2 exchanges]"),
+          file=sys.stderr)
+    return compacted
 
 
 def _restyle_headings(text):
@@ -308,6 +406,10 @@ def main():
                    help="generate from --system + prompt args, print raw text, exit")
     p.add_argument("prompt", nargs="*",              # the prompt, in --oneshot mode
                    help="prompt text (--oneshot only; pass after `--`)")
+    p.add_argument("--no-compact", action="store_true",  # REPL only
+                   help="disable automatic context compaction (/compact still works)")
+    p.add_argument("--compact-threshold", type=int, default=DEFAULT_COMPACT_THRESHOLD,
+                   help="effective-input token threshold that triggers auto-compaction")
     args = p.parse_args()
 
     label = MODEL_LABELS.get(args.model, args.model)
@@ -342,8 +444,8 @@ def main():
         if not prompt:
             return 0
         try:
-            text = call_api(key, args.model, args.system or "",
-                            [{"role": "user", "content": prompt}])
+            text, _ = call_api(key, args.model, args.system or "",
+                               [{"role": "user", "content": prompt}])
         except RuntimeError as e:
             print(f"ask: {e}", file=sys.stderr)
             return 1
@@ -360,13 +462,17 @@ def main():
         print("chat: no ANTHROPIC_API_KEY in the environment.", file=sys.stderr)
         return 1
 
-    messages = []  # the entire conversation, re-sent each turn; in memory only.
+    messages = []       # the entire conversation, re-sent each turn; in memory only.
+    last_usage = {}     # usage object from the most recent turn (for /usage + trigger)
+    compact_enabled = not args.no_compact
+    compact_threshold = args.compact_threshold
 
     if not MDCAT:
         print("chat: mdcat not found — printing raw Markdown "
               "(brew install mdcat to render).", file=sys.stderr)
-    print(_ansi("2", f"chat · {label} · 'exit'/'quit'/Ctrl-D to leave · "
-                      "'/reset' clears · '/edit' composes in $EDITOR"),
+    compact_note = "" if compact_enabled else " · auto-compact off"
+    print(_ansi("2", f"chat · {label}{compact_note} · 'exit'/'quit'/Ctrl-D to leave · "
+                      "commands: /reset /edit /compact /usage"),
           file=sys.stderr)
 
     # label / chip_sgr / bar were computed at the top of main() (shared with --render).
@@ -403,7 +509,26 @@ def main():
             break
         if msg == "/reset":
             messages.clear()
+            last_usage = {}
             print(_ansi("2", "context cleared."), file=sys.stderr)
+            continue
+        if msg == "/usage":
+            if not last_usage:
+                print(_ansi("2", "no usage yet — send a message first."),
+                      file=sys.stderr)
+            else:
+                u = last_usage
+                print(f"input={u.get('input_tokens', 0)}  "
+                      f"output={u.get('output_tokens', 0)}  "
+                      f"cache_creation={u.get('cache_creation_input_tokens', 0)}  "
+                      f"cache_read={u.get('cache_read_input_tokens', 0)}")
+            continue
+        if msg == "/compact":
+            # Manual: runs regardless of threshold, ignores --no-compact, but still
+            # honors the "too little history → skip" rule (announced out loud).
+            new = compact(key, messages, announce_skip=True)
+            if new is not None:
+                messages = new
             continue
         if msg == "/edit" or msg.startswith("/edit "):
             # Anything after "/edit " seeds the buffer (e.g. "/edit fix this:").
@@ -423,9 +548,11 @@ def main():
         messages.append({"role": "user", "content": msg})
         try:
             # The spinner animates on stderr while call_api blocks; the `with` stops
-            # and erases it on success, error, and Ctrl-C alike.
+            # and erases it on success, error, and Ctrl-C alike. cache=True marks the
+            # re-sent prefix cacheable (see _with_cache_breakpoint).
             with _Spinner(bar_fg):
-                reply = call_api(key, args.model, args.system, messages)
+                reply, last_usage = call_api(key, args.model, args.system,
+                                             messages, cache=True)
         except RuntimeError as e:
             messages.pop()          # drop the unanswered turn → history stays valid
             print(_ansi("2", f"chat: {e}"), file=sys.stderr)
@@ -439,6 +566,20 @@ def main():
         print()                              # space between your line and the reply
         print(model_chip)                    # ` opus ` / ` sonnet ` header chip
         render(reply, bar)
+
+        # Auto-compaction. Done AFTER rendering so it never delays the current reply.
+        # effective_input sums the three usage fields that partition the true prompt
+        # size when caching is on (input_tokens alone counts only the uncached part).
+        # A successful compaction drops the prompt well below threshold, so it can't
+        # re-fire until the conversation grows large again.
+        if compact_enabled and last_usage:
+            effective_input = (last_usage.get("input_tokens", 0)
+                               + last_usage.get("cache_read_input_tokens", 0)
+                               + last_usage.get("cache_creation_input_tokens", 0))
+            if effective_input >= compact_threshold:
+                new = compact(key, messages)
+                if new is not None:
+                    messages = new
 
     return 0
 
