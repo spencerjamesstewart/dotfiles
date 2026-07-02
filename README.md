@@ -7,16 +7,18 @@ not in this repo. License: MIT.
 ## ask / chat — terminal LLM helpers
 
 Two zsh functions (`zsh/functions.zsh`; the `chat` REPL is backed by
-`bin/chat-repl.py`), both defaulting to **Claude Sonnet 4.6**:
+`bin/chat-repl.py`), both defaulting to **Claude Sonnet 5**:
 
-- `ask "..."` — one-shot question, streamed to the terminal as raw Markdown.
+- `ask "..."` — one-shot question, rendered inline as Markdown (model badge +
+  gutter bar). Non-interactive/piped/tool use prints raw Markdown instead.
 - `chat` — interactive, multi-turn REPL with replies rendered via `mdcat`.
 
-Flags (same for both): `-o`/`--opus` switches to **Claude Opus 4.8**;
-`-v`/`--verbose` gives fuller-but-tight answers and composes with `-o`.
+Flags (same for both): `-f`/`--fable` switches to **Claude Fable 5** (the most
+capable model); `-v`/`--verbose` gives fuller-but-tight answers and composes
+with `-f`.
 
-`ask` runs through the `llm` CLI; `chat` calls the Anthropic Messages API
-directly (needs `ANTHROPIC_API_KEY`, or a key from `llm keys set anthropic`).
+Both call the Anthropic Messages API directly (no `llm` CLI). The key comes from
+`ANTHROPIC_API_KEY`, else `~/.config/anthropic/key` (one line, `chmod 600`).
 
 ### chat REPL commands
 

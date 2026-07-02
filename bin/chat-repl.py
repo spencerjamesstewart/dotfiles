@@ -51,6 +51,8 @@ TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
 # Friendly labels for the chips/prompt; falls back to the raw id if unmapped.
 MODEL_LABELS = {
+    "claude-sonnet-5": "sonnet",
+    "claude-fable-5": "fable",
     "claude-sonnet-4-6": "sonnet",
     "claude-opus-4-8": "opus",
 }
@@ -65,10 +67,12 @@ MODEL_LABELS = {
 YOU_SGR = "1;97;42"     # your turn: bold white on green
 GUTTER = "▌"            # the bar glyph; one cell + one space = a 2-col gutter
 
-# model id → (chip SGR, gutter-bar fg). Magenta = opus, blue = sonnet; both are
-# distinct from your green chip so human and assistant never blur together. The
-# fallback covers any unlisted model.
+# model id → (chip SGR, gutter-bar fg). Magenta = the escalated most-capable
+# model (fable), blue = sonnet; both are distinct from your green chip so human
+# and assistant never blur together. The fallback covers any unlisted model.
 ACCENTS = {
+    "claude-sonnet-5":   ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
+    "claude-fable-5":    ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-opus-4-8":   ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-sonnet-4-6": ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
 }
@@ -148,12 +152,10 @@ def call_api(key, model, system, messages):
     Raises RuntimeError with a human-readable message on any API/network error;
     the caller keeps the REPL alive and leaves history untouched.
     """
-    body = json.dumps({
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "system": system,
-        "messages": messages,
-    }).encode("utf-8")
+    payload = {"model": model, "max_tokens": MAX_TOKENS, "messages": messages}
+    if system:
+        payload["system"] = system   # omit when empty; the API rejects a blank system
+    body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         API_URL,
         data=body,
@@ -300,8 +302,12 @@ def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--model", required=True)
     p.add_argument("--system")                       # required for the REPL only
-    p.add_argument("--render", action="store_true",  # one-shot pipe mode for `ask`
+    p.add_argument("--render", action="store_true",  # render-from-stdin mode for `ask`
                    help="render Markdown from stdin (with badge/bar) and exit")
+    p.add_argument("--oneshot", action="store_true",  # generate-and-print mode for `ask`
+                   help="generate from --system + prompt args, print raw text, exit")
+    p.add_argument("prompt", nargs="*",              # the prompt, in --oneshot mode
+                   help="prompt text (--oneshot only; pass after `--`)")
     args = p.parse_args()
 
     label = MODEL_LABELS.get(args.model, args.model)
@@ -321,6 +327,28 @@ def main():
         if sys.stdout.isatty():
             print(_chip(label, chip_sgr))
         render(text, bar)
+        return 0
+
+    # --oneshot: the generate-and-print path for `ask`. POST a single Messages
+    # request and write the raw answer to stdout; the interactive `ask` then pipes
+    # it back through --render. Strip any ANSI the [truncated]/[empty response]
+    # markers add so escapes never leak into the Markdown mdcat renders downstream.
+    if args.oneshot:
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            print("ask: no ANTHROPIC_API_KEY in the environment.", file=sys.stderr)
+            return 1
+        prompt = " ".join(args.prompt).strip()
+        if not prompt:
+            return 0
+        try:
+            text = call_api(key, args.model, args.system or "",
+                            [{"role": "user", "content": prompt}])
+        except RuntimeError as e:
+            print(f"ask: {e}", file=sys.stderr)
+            return 1
+        text = re.sub(r"\033\[[0-9;]*m", "", text)   # drop marker styling
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
         return 0
 
     if not args.system:
