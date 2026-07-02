@@ -231,8 +231,28 @@ def call_api(key, model, system, messages, max_tokens=MAX_TOKENS, cache=False):
         for block in data.get("content", [])
         if block.get("type") == "text"
     )
-    if data.get("stop_reason") == "max_tokens":
+    stop_reason = data.get("stop_reason")
+    if stop_reason == "max_tokens":
         text += _ansi("2", f"\n\n[truncated at {max_tokens} tokens]")
+    elif stop_reason == "refusal":
+        # A safety classifier declined the request: HTTP 200 with stop_reason
+        # "refusal" and (usually) an empty content array — Fable trips these readily
+        # on biology/cyber topics. Without this branch the empty content falls through
+        # to "[empty response]", hiding *why*. stop_details carries the category when
+        # present but can be null even on a refusal, so we key off stop_reason and
+        # guard the details. (Ordinary model refusals on Sonnet come back as normal
+        # text with stop_reason "end_turn", so they never reach here.)
+        details = data.get("stop_details") or {}
+        category = details.get("category")
+        note = "content safety classifier declined this request"
+        if category:
+            note += f" (category: {category})"
+        if model == "claude-fable-5":
+            note += "; Fable's classifiers are strict — retry without -f to use Sonnet"
+        marker = _ansi("2", f"[refused: {note}]")
+        # Pre-output refusal → empty content → just the marker; a partial (mid-turn)
+        # refusal keeps what was generated and appends the notice.
+        text = f"{text}\n\n{marker}" if text.strip() else marker
     usage = data.get("usage") or {}
     return (text or _ansi("2", "[empty response]")), usage
 
