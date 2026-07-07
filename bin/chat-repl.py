@@ -72,6 +72,7 @@ MODEL_LABELS = {
     "claude-fable-5": "fable",
     "claude-sonnet-4-6": "sonnet",
     "claude-opus-4-8": "opus",
+    "claude-haiku-4-5": "haiku",
 }
 
 # Per-turn styling. Each speaker gets a reverse-video "chip" — a padded label on a
@@ -92,6 +93,7 @@ ACCENTS = {
     "claude-fable-5":    ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-opus-4-8":   ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-sonnet-4-6": ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
+    "claude-haiku-4-5":  ("1;30;46", "96"),   # black-on-cyan    chip, bright-cyan    bar
 }
 DEFAULT_ACCENT = ("1;97;45", "95")
 
@@ -187,18 +189,25 @@ def _with_cache_breakpoint(messages):
     return out
 
 
-def call_api(key, model, system, messages, max_tokens=MAX_TOKENS, cache=False):
+def call_api(key, model, system, messages, max_tokens=MAX_TOKENS, cache=False,
+             effort=None):
     """POST the whole conversation; return (assistant_text, usage_dict).
 
     `usage_dict` is the API's usage object (input/output/cache token counts); it
     is `{}` if the response omits it. When `cache=True`, an ephemeral cache
     breakpoint is placed on the final message so the re-sent prefix bills at the
-    cache-read rate. Raises RuntimeError with a human-readable message on any
-    API/network error; the caller keeps the REPL alive and leaves history intact.
+    cache-read rate. `effort` (low/medium/high) becomes output_config.effort —
+    the thinking-depth / token-spend dial; None omits it entirely, which the API
+    treats as "high". Haiku 4.5 rejects the parameter, so callers using a Haiku
+    model (e.g. compact()) must leave it None. Raises RuntimeError with a
+    human-readable message on any API/network error; the caller keeps the REPL
+    alive and leaves history intact.
     """
     if cache:
         messages = _with_cache_breakpoint(messages)
     payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    if effort:
+        payload["output_config"] = {"effort": effort}
     if system:
         payload["system"] = system   # omit when empty; the API rejects a blank system
     body = json.dumps(payload).encode("utf-8")
@@ -426,6 +435,10 @@ def main():
                    help="generate from --system + prompt args, print raw text, exit")
     p.add_argument("prompt", nargs="*",              # the prompt, in --oneshot mode
                    help="prompt text (--oneshot only; pass after `--`)")
+    p.add_argument("--effort", choices=("low", "medium", "high"),
+                   help="output_config.effort for the main model; omit to use the "
+                        "API default (high). The shell layer omits it for Haiku, "
+                        "which rejects the parameter.")
     p.add_argument("--no-compact", action="store_true",  # REPL only
                    help="disable automatic context compaction (/compact still works)")
     p.add_argument("--compact-threshold", type=int, default=DEFAULT_COMPACT_THRESHOLD,
@@ -465,7 +478,8 @@ def main():
             return 0
         try:
             text, _ = call_api(key, args.model, args.system or "",
-                               [{"role": "user", "content": prompt}])
+                               [{"role": "user", "content": prompt}],
+                               effort=args.effort)
         except RuntimeError as e:
             print(f"ask: {e}", file=sys.stderr)
             return 1
@@ -490,8 +504,13 @@ def main():
     if not MDCAT:
         print("chat: mdcat not found — printing raw Markdown "
               "(brew install mdcat to render).", file=sys.stderr)
+    # Session banner: always states the model AND the effort in effect. Haiku
+    # sessions arrive with no --effort (the parameter isn't supported there), so
+    # they honestly say "n/a" rather than implying a level is set.
+    effort_note = f" · effort {args.effort}" if args.effort else " · effort n/a"
     compact_note = "" if compact_enabled else " · auto-compact off"
-    print(_ansi("2", f"chat · {label}{compact_note} · 'exit'/'quit'/Ctrl-D to leave · "
+    print(_ansi("2", f"chat · {label}{effort_note}{compact_note} · "
+                      "'exit'/'quit'/Ctrl-D to leave · "
                       "commands: /reset /edit /compact /usage"),
           file=sys.stderr)
 
@@ -572,7 +591,8 @@ def main():
             # re-sent prefix cacheable (see _with_cache_breakpoint).
             with _Spinner(bar_fg):
                 reply, last_usage = call_api(key, args.model, args.system,
-                                             messages, cache=True)
+                                             messages, cache=True,
+                                             effort=args.effort)
         except RuntimeError as e:
             messages.pop()          # drop the unanswered turn → history stays valid
             print(_ansi("2", f"chat: {e}"), file=sys.stderr)

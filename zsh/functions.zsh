@@ -4,9 +4,14 @@
 # Requires: python3 + an Anthropic API key (see the key file below); mdcat for
 # the rendered look.
 #
-#   ask "..."            one-shot, Sonnet 5 (default), very terse
+#   ask "..."            one-shot, Sonnet 5 (default), very terse, effort low
+#   ask -h "..."         drop to Haiku 4.5       (--haiku, fastest/cheapest)
+#   ask -o "..."         escalate to Opus 4.8    (--opus)
 #   ask -f "..."         escalate to Fable 5     (--fable, most capable)
-#   ask -v "..."         fuller-but-tight answer (--verbose); composes with -f
+#   ask -e <level> "..." effort: low (default) | medium | high (--effort) —
+#                        the API's thinking-depth/token-spend dial; not valid
+#                        with -h (Haiku rejects the parameter)
+#   ask -v "..."         fuller-but-tight answer (--verbose); composes with any model flag
 #
 # In an interactive shell the answer is Markdown-RENDERED through chat's backend —
 # same look as `chat`: a model badge, a coloured gutter bar, and orange headings
@@ -62,7 +67,11 @@ _anthropic_key() {
 # --oneshot mode, printing the raw answer. This is what tools call directly,
 # e.g.  ASK_TOOL=anki-ask _ask_oneshot claude-sonnet-5 "$sys" "the prompt"
 # NOTE: <model> must be a real Anthropic API id (dashes), NOT an llm alias.
-# Usage: _ask_oneshot <model> <system-prompt> <prompt...>
+# Effort rides the ASK_EFFORT env var (low|medium|high; default low) rather than
+# a new positional arg, so existing tool callers keep working unchanged. Haiku
+# doesn't support the effort parameter (the API rejects it with a 400), so it is
+# omitted for claude-haiku-* models regardless of ASK_EFFORT.
+# Usage: [ASK_EFFORT=<level>] _ask_oneshot <model> <system-prompt> <prompt...>
 _ask_oneshot() {
   local model="$1" sys="$2"; shift 2
   local key; key="$(_anthropic_key)"
@@ -70,25 +79,44 @@ _ask_oneshot() {
     print -u2 "ask: no Anthropic key — set ANTHROPIC_API_KEY or write it to $_ANTHROPIC_KEY_FILE."
     return 1
   }
+  local -a effort_args
+  [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "${ASK_EFFORT:-low}")
   # `--` stops the backend's option parsing, so a prompt starting with `-` is safe.
   ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
-    --oneshot --model "$model" --system "$sys" -- "$*"
+    --oneshot --model "$model" --system "$sys" "${effort_args[@]}" -- "$*"
 }
 
 ask() {
   local sys="$_ASK_SYS_TERSE"
   local model="claude-sonnet-5"     # default: balanced speed + intelligence
+  local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
 
   # Parse leading flags; combinable in any order. All are stateless, so they are
   # honored everywhere — interactive shells and tool callers alike.
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
+      -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
+      -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;   # escalate to the most capable
+      -e|--effort)
+        shift
+        case "$1" in
+          low|medium|high) effort="$1"; effort_explicit=1 ;;
+          *) print -u2 "ask: -e needs low, medium, or high."; return 1 ;;
+        esac ;;
       *) break ;;
     esac
     shift
   done
+
+  # Haiku doesn't support the effort parameter — the API rejects the request
+  # with a 400. Fail loudly on an explicit -e rather than silently ignoring it;
+  # without -e, Haiku just runs effort-less (the default can't apply to it).
+  if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
+    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, or -f."
+    return 1
+  fi
 
   # Interactive shell → render the answer with the chat look (badge + gutter bar +
   # headings) via the shared backend's --render mode. Everything else — a tool
@@ -96,10 +124,10 @@ ask() {
   # the raw one-shot path untouched, so tool callers and pipelines are unaffected.
   # (Piping into --render naturally buffers the full answer first.)
   if [[ -t 1 && -z "$ASK_TOOL" && -f "$_CHAT_BACKEND" ]] && command -v python3 >/dev/null 2>&1; then
-    _ask_oneshot "$model" "$sys" "$*" \
+    ASK_EFFORT="$effort" _ask_oneshot "$model" "$sys" "$*" \
       | python3 "$_CHAT_BACKEND" --render --model "$model"
   else
-    _ask_oneshot "$model" "$sys" "$*"   # raw, stateless — tools/pipes land here
+    ASK_EFFORT="$effort" _ask_oneshot "$model" "$sys" "$*"   # raw — tools/pipes land here
   fi
 }
 
@@ -107,9 +135,15 @@ ask() {
 # readable counterpart to ask's raw one-shot output.
 # Requires: python3 + mdcat. Reuses ask's shared prompts and Anthropic key.
 #
-#   chat            multi-turn, Sonnet 5 (default), terse
+#   chat            multi-turn, Sonnet 5 (default), terse, effort low
+#   chat -h         drop to Haiku 4.5       (--haiku, fastest/cheapest)
+#   chat -o         escalate to Opus 4.8    (--opus)
 #   chat -f         escalate to Fable 5     (--fable, most capable)
-#   chat -v         fuller-but-tight answers (--verbose); composes with -f
+#   chat -e <level> effort: low (default) | medium | high (--effort); not valid
+#                   with -h (Haiku rejects the parameter)
+#   chat -v         fuller-but-tight answers (--verbose); composes with any model flag
+#
+# The startup banner states the model and effort in play for the session.
 #   chat --no-compact           keep the whole history; disable auto-compaction
 #   chat --compact-threshold N  auto-compact once effective input ≥ N tokens (default 8000)
 #
@@ -140,12 +174,21 @@ chat() {
   local sys="$_ASK_SYS_TERSE"
   # Real Anthropic API ids: the backend calls the Messages API directly.
   local model="claude-sonnet-5"   # default: balanced speed + intelligence
+  local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
   local -a compact_args           # compaction flags forwarded to the backend
 
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
+      -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
+      -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;    # escalate to the most capable
+      -e|--effort)
+        shift
+        case "$1" in
+          low|medium|high) effort="$1"; effort_explicit=1 ;;
+          *) print -u2 "chat: -e needs low, medium, or high."; return 1 ;;
+        esac ;;
       --no-compact) compact_args+=(--no-compact) ;;   # off by request; no short form
       --compact-threshold)
         shift
@@ -159,8 +202,23 @@ chat() {
     shift
   done
 
-  [[ "$model" != claude-sonnet-5 ]] && \
-    print -u2 "chat: heads-up — Fable costs more per token than the default (Sonnet); prompt caching + auto-compaction soften long-chat cost, but Sonnet is still cheaper."
+  # Same rule as ask: Haiku has no effort parameter, so an explicit -e is an
+  # error (the API would reject it), and the low default is simply not sent.
+  if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
+    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, or -f."
+    return 1
+  fi
+  local -a effort_args
+  [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "$effort")
+
+  # Cost heads-up only for models pricier than the default (Haiku is cheaper).
+  local pricier=""
+  case "$model" in
+    claude-fable-5)  pricier="Fable" ;;
+    claude-opus-4-8) pricier="Opus" ;;
+  esac
+  [[ -n "$pricier" ]] && \
+    print -u2 "chat: heads-up — $pricier costs more per token than the default (Sonnet); prompt caching + auto-compaction soften long-chat cost, but Sonnet is still cheaper."
 
   # Resolve the key (env override, else the key file) and hand it to the backend
   # via the environment only — never argv (which `ps` can see) or disk.
@@ -176,7 +234,7 @@ chat() {
   }
 
   ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
-    --model "$model" --system "$sys" "${compact_args[@]}"
+    --model "$model" --system "$sys" "${effort_args[@]}" "${compact_args[@]}"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
