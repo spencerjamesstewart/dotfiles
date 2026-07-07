@@ -13,6 +13,10 @@
 #                        with -h (Haiku rejects the parameter)
 #   ask -v "..."         fuller-but-tight answer (--verbose); composes with any model flag
 #
+# Default terseness is model-dependent: Haiku and Sonnet get an extra-terse
+# prompt (they run long otherwise); Opus and Fable keep the standard terse one.
+# -v overrides both.
+#
 # In an interactive shell the answer is Markdown-RENDERED through chat's backend —
 # same look as `chat`: a model badge, a coloured gutter bar, and orange headings
 # (rendering needs the whole answer, so it buffers instead of streaming; a `…` hint
@@ -36,11 +40,27 @@
 # Shared system prompts — single source of truth; the one-shot path (`ask`) and
 # the REPL (`chat`) reuse these verbatim, so there is no copy-paste drift. `chat`
 # passes the chosen one into its Python backend via --system, so the text is
-# never duplicated outside this file. Both always request Markdown; the terse
-# one stays tight but still leans on Markdown structure — only a genuinely
-# trivial reply comes back as plain text.
+# never duplicated outside this file.
+# Three tiers:
+#   VERY_TERSE — default for Haiku and Sonnet, which run to verbosity otherwise:
+#                the answer and nothing else, one line when possible.
+#   TERSE      — default for Opus and Fable (already well-calibrated): tight but
+#                lightly structured Markdown.
+#   VERBOSE    — -v on any model: fuller but still no filler.
+_ASK_SYS_VERY_TERSE='You are a terminal assistant. Be extremely terse: give only the answer itself, in as few words as it allows — a single line whenever possible. No preamble, no sign-off, no restating the question, no caveats, and no explanation or surrounding context unless explicitly asked. Use Markdown only where it genuinely helps: fenced code blocks with a language tag for commands and code, a short bullet list for several parallel items. Everything else is plain text.'
 _ASK_SYS_TERSE='You are a terminal assistant. Keep answers tight — no preamble, no sign-off, no restating the question, no caveats unless essential. Always format the answer as Markdown, and use light structure where it helps: bullet or numbered lists for multiple items, **bold** for key terms, and fenced code blocks with a language tag for commands and code. Only a genuinely trivial reply — a single word or a short one-liner — should be plain text.'
 _ASK_SYS_VERBOSE='You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Always format the answer as Markdown; wrap code in fenced blocks with a language tag.'
+
+# _ask_default_sys: pick the default system prompt for a model — the very-terse
+# tier for Haiku/Sonnet, the standard terse tier for everything else. Used by
+# ask and chat when -v wasn't given; the choice must happen AFTER flag parsing,
+# since the model isn't known until then.
+_ask_default_sys() {
+  case "$1" in
+    claude-haiku-*|claude-sonnet-*) print -r -- "$_ASK_SYS_VERY_TERSE" ;;
+    *)                              print -r -- "$_ASK_SYS_TERSE" ;;
+  esac
+}
 
 # Absolute path to chat's Python backend, resolved from THIS file's own location
 # (the same idiom zshrc uses to find the repo) so `chat` works regardless of
@@ -87,7 +107,7 @@ _ask_oneshot() {
 }
 
 ask() {
-  local sys="$_ASK_SYS_TERSE"
+  local sys=""                      # resolved after flag parsing (model-dependent)
   local model="claude-sonnet-5"     # default: balanced speed + intelligence
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
 
@@ -109,6 +129,9 @@ ask() {
     esac
     shift
   done
+
+  # No -v → model-dependent default: very terse for Haiku/Sonnet, terse for the rest.
+  [[ -n "$sys" ]] || sys="$(_ask_default_sys "$model")"
 
   # Haiku doesn't support the effort parameter — the API rejects the request
   # with a 400. Fail loudly on an explicit -e rather than silently ignoring it;
@@ -143,6 +166,9 @@ ask() {
 #                   with -h (Haiku rejects the parameter)
 #   chat -v         fuller-but-tight answers (--verbose); composes with any model flag
 #
+# Default terseness matches ask: extra-terse for Haiku/Sonnet, standard terse
+# for Opus/Fable; -v overrides both.
+#
 # The startup banner states the model and effort in play for the session.
 #   chat --no-compact           keep the whole history; disable auto-compaction
 #   chat --compact-threshold N  auto-compact once effective input ≥ N tokens (default 8000)
@@ -171,7 +197,7 @@ chat() {
     return 1
   }
 
-  local sys="$_ASK_SYS_TERSE"
+  local sys=""                    # resolved after flag parsing (model-dependent)
   # Real Anthropic API ids: the backend calls the Messages API directly.
   local model="claude-sonnet-5"   # default: balanced speed + intelligence
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
@@ -201,6 +227,9 @@ chat() {
     esac
     shift
   done
+
+  # No -v → model-dependent default: very terse for Haiku/Sonnet, terse for the rest.
+  [[ -n "$sys" ]] || sys="$(_ask_default_sys "$model")"
 
   # Same rule as ask: Haiku has no effort parameter, so an explicit -e is an
   # error (the API would reject it), and the low default is simply not sent.

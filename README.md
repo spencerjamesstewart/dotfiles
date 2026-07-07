@@ -18,6 +18,10 @@ capable model); `-v`/`--verbose` gives fuller-but-tight answers and composes
 with `-f`. `chat` additionally takes `--no-compact` and `--compact-threshold N`
 (see below).
 
+Default terseness is model-dependent: Haiku and Sonnet get an extra-terse
+system prompt (just the answer, one line when possible); Opus and Fable keep
+the standard terse prompt. `-v` overrides both.
+
 Both call the Anthropic Messages API directly (no `llm` CLI). The key comes from
 `ANTHROPIC_API_KEY`, else `~/.config/anthropic/key` (one line, `chmod 600`).
 
