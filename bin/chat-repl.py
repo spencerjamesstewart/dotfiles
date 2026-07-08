@@ -13,7 +13,7 @@ Design / isolation notes (mirroring the framing in functions.zsh):
   * Two backends, two plain code paths. --backend anthropic (default) speaks
     the Messages API via call_api(); --backend openrouter speaks OpenAI Chat
     Completions via call_openrouter() (gpt-oss-120b, Grok 4.3, DeepSeek V4
-    Flash; per-model provider pins live in OPENROUTER_PROVIDER). They are
+    Flash; per-model provider preferences live in OPENROUTER_PROVIDER). They are
     deliberately parallel functions,
     not one abstraction — the wire formats differ in enough small ways (system
     placement, response shape, refusal signalling, usage field names) that two
@@ -59,14 +59,16 @@ MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
 # OpenRouter (the --backend openrouter path; OpenAI Chat Completions format).
-# OPENROUTER_PROVIDER holds OPTIONAL per-model provider pins: gpt-oss is pinned
-# to the fast serving providers with fallbacks off — predictable speed over
-# availability (the softer alternative is the ":nitro" model-id suffix with no
-# provider block). Models not listed here route freely: Grok is xAI-only anyway,
-# and DeepSeek has a dozen-plus providers OpenRouter can arbitrage.
+# OPENROUTER_PROVIDER holds OPTIONAL per-model routing preferences: gpt-oss
+# tries the fast serving providers first ("order"), and falls back to whatever
+# else OpenRouter has when both are saturated — availability over predictable
+# speed (a hard pin with allow_fallbacks: False was tried and hit 429s often
+# enough to hurt). Models not listed here route freely: Grok is xAI-only
+# anyway, and DeepSeek has a dozen-plus providers OpenRouter can arbitrage.
+# The --stats provider= field shows who actually served each reply.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_PROVIDER = {
-    "openai/gpt-oss-120b": {"only": ["groq", "cerebras"], "allow_fallbacks": False},
+    "openai/gpt-oss-120b": {"order": ["groq", "cerebras"]},
 }
 
 # Auto-compaction (REPL only). When the effective prompt size crosses the
@@ -346,24 +348,35 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace")
+    # Even with fallbacks on, a 429/5xx can slip through when the whole pool is
+    # briefly saturated — and capacity usually frees up within seconds. Retry
+    # those transient statuses a few times before giving up; the spinner is
+    # already running, so the pause reads as a slow reply, not a stall.
+    for attempt in range(4):                    # 3 retries: ~1s + 2s + 4s
         try:
-            detail = json.loads(detail)["error"]["message"]
-        except Exception:
-            pass
-        # Provider-availability errors need context when a pin applied: with
-        # fallbacks off, "no providers" means *the pinned ones* are down, not
-        # the model — say so instead of leaving a mystery.
-        if pin and "provider" in str(detail).lower():
-            detail = (f"{detail} (note: this setup pins "
-                      f"{'/'.join(pin['only'])} with fallbacks off)")
-        raise RuntimeError(f"API error {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"network error: {e.reason}")
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503) and attempt < 3:
+                time.sleep(2 ** attempt)
+                continue
+            detail = e.read().decode("utf-8", "replace")
+            try:
+                detail = json.loads(detail)["error"]["message"]
+            except Exception:
+                pass
+            # Provider-availability errors need context when routing prefs
+            # applied: name the preferred providers so the error isn't a
+            # mystery. (With fallbacks on this should be rare — it means the
+            # whole pool was exhausted, not just the preferred ones.)
+            preferred = (pin or {}).get("order") or (pin or {}).get("only")
+            if preferred and "provider" in str(detail).lower():
+                detail = (f"{detail} (note: this setup prefers "
+                          f"{'/'.join(preferred)}, fallbacks on)")
+            raise RuntimeError(f"API error {e.code}: {detail}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"network error: {e.reason}")
 
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -381,6 +394,10 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
     elif finish == "length":
         text += _ansi("2", f"\n\n[truncated at {max_tokens} tokens]")
     usage = data.get("usage") or {}
+    # OpenRouter names the serving provider top-level in the response; tuck it
+    # into usage so it rides along to --stats / /usage without a wider return.
+    if data.get("provider"):
+        usage["provider"] = data["provider"]
     return (text or _ansi("2", "[empty response]")), usage
 
 
@@ -423,6 +440,8 @@ def _print_stats(backend, elapsed, usage, total=None):
     line += f" in={tin} out={tout}"
     if cached is not None:
         line += f" cached={cached}"
+    if usage.get("provider"):            # OpenRouter only: who served this reply
+        line += f" provider={usage['provider'].lower()}"
     # \r + erase first: when `ask` pipes --oneshot into --render, the render
     # process's spinner may own the current stderr line — clear it so the stats
     # line never lands appended to a half-drawn spinner frame.
@@ -775,7 +794,8 @@ def main():
                 details = u.get("prompt_tokens_details") or {}
                 print(f"input={u.get('prompt_tokens', 0)}  "
                       f"output={u.get('completion_tokens', 0)}  "
-                      f"cached={details.get('cached_tokens', 0)}")
+                      f"cached={details.get('cached_tokens', 0)}  "
+                      f"provider={u.get('provider', '?').lower()}")
             else:
                 u = last_usage
                 print(f"input={u.get('input_tokens', 0)}  "
