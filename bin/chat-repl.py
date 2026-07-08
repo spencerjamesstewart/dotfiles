@@ -7,9 +7,17 @@ key, and exec's this script. Everything stateful lives here, in memory, for the
 life of the process.
 
 Design / isolation notes (mirroring the framing in functions.zsh):
-  * Stdlib only. We talk to the Anthropic Messages API directly over HTTPS with
-    urllib — no `anthropic` SDK, so there is no pip/venv to manage. The only
+  * Stdlib only. We talk to the APIs directly over HTTPS with urllib — no
+    `anthropic`/`openai` SDK, so there is no pip/venv to manage. The only
     external dependencies are python3 (always present) and `mdcat` (rendering).
+  * Two backends, two plain code paths. --backend anthropic (default) speaks
+    the Messages API via call_api(); --backend openrouter speaks OpenAI Chat
+    Completions via call_openrouter() (used for gpt-oss-120b, pinned to the
+    fast Groq/Cerebras providers). They are deliberately parallel functions,
+    not one abstraction — the wire formats differ in enough small ways (system
+    placement, response shape, refusal signalling, usage field names) that two
+    commented paths stay clearer than a parameterized one. call_backend() is
+    just the switch. Keys: ANTHROPIC_API_KEY / OPENROUTER_API_KEY, env-only.
   * Nothing persists. The conversation is a plain in-memory list, re-sent in
     full each turn and discarded when the process exits. We import `readline`
     for in-session line editing but NEVER write a history file, so relaunching
@@ -49,15 +57,31 @@ API_VERSION = "2023-06-01"
 MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
+# OpenRouter (the --backend openrouter path; OpenAI Chat Completions format).
+# The provider block pins the fast serving providers and disables fallbacks —
+# predictable speed over availability. The softer alternative is model id
+# "openai/gpt-oss-120b:nitro" with no provider block (OpenRouter then picks a
+# fast provider itself, with fallbacks).
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_PROVIDER = {"only": ["groq", "cerebras"], "allow_fallbacks": False}
+
 # Auto-compaction (REPL only). When the effective prompt size crosses the
-# threshold, older turns are summarized by a cheap Haiku one-shot into a single
+# threshold, older turns are summarized by a cheap one-shot into a single
 # synthetic exchange, keeping the recent tail intact. On by default; the
 # `--no-compact` flag disables only the automatic trigger (manual `/compact`
 # still works). The summarizer prompt lives HERE, not in functions.zsh — it's an
 # internal implementation detail, not one of the user-facing _ASK_SYS_* prompts.
+# The summarizer stays in-backend so an OpenRouter session never needs the
+# Anthropic key (and vice versa).
 COMPACT_MODEL = "claude-haiku-4-5"     # cheap + fast; summaries don't need Sonnet
+COMPACT_MODEL_OPENROUTER = "openai/gpt-oss-120b"   # already cheap; keeps -g one-key
 COMPACT_MAX_TOKENS = 600
 DEFAULT_COMPACT_THRESHOLD = 8000       # effective input tokens (see main loop)
+# The OpenRouter default triggers much later: on Groq/Cerebras the motive is
+# interactive latency (decode slowdown at deep context, cold-prefill protection)
+# rather than cost, and compacting too eagerly thrashes the provider's automatic
+# prefix cache. An explicit --compact-threshold overrides either default.
+OPENROUTER_COMPACT_THRESHOLD = 35000
 SUMMARIZER_SYS = (
     "Summarize this conversation transcript densely for use as context in a "
     "continuing conversation. Preserve: established facts and definitions, "
@@ -73,6 +97,7 @@ MODEL_LABELS = {
     "claude-sonnet-4-6": "sonnet",
     "claude-opus-4-8": "opus",
     "claude-haiku-4-5": "haiku",
+    "openai/gpt-oss-120b": "gpt-oss",
 }
 
 # Per-turn styling. Each speaker gets a reverse-video "chip" — a padded label on a
@@ -86,14 +111,16 @@ YOU_SGR = "1;97;42"     # your turn: bold white on green
 GUTTER = "▌"            # the bar glyph; one cell + one space = a 2-col gutter
 
 # model id → (chip SGR, gutter-bar fg). Magenta = the escalated most-capable
-# model (fable), blue = sonnet; both are distinct from your green chip so human
-# and assistant never blur together. The fallback covers any unlisted model.
+# model (fable), blue = sonnet, yellow = the non-Anthropic guest (gpt-oss); all
+# are distinct from your green chip so human and assistant never blur together.
+# The fallback covers any unlisted model.
 ACCENTS = {
     "claude-sonnet-5":   ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
     "claude-fable-5":    ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-opus-4-8":   ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
     "claude-sonnet-4-6": ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
     "claude-haiku-4-5":  ("1;30;46", "96"),   # black-on-cyan    chip, bright-cyan    bar
+    "openai/gpt-oss-120b": ("1;30;43", "93"), # black-on-yellow  chip, bright-yellow  bar
 }
 DEFAULT_ACCENT = ("1;97;45", "95")
 
@@ -266,6 +293,125 @@ def call_api(key, model, system, messages, max_tokens=MAX_TOKENS, cache=False,
     return (text or _ansi("2", "[empty response]")), usage
 
 
+def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
+                    effort=None):
+    """POST the whole conversation to OpenRouter; return (assistant_text, usage).
+
+    The OpenRouter twin of call_api(), speaking OpenAI Chat Completions format —
+    kept as a separate, parallel function on purpose (two plain code paths beat
+    one parameterized abstraction). The format differences it owns:
+      * `system` becomes a leading {"role": "system"} message, not a top-level
+        field.
+      * The reply lives at choices[0].message.content. A reasoning model's
+        thinking may arrive alongside it (message.reasoning) and is deliberately
+        never read — only the final answer is shown.
+      * `effort` maps to reasoning.effort (gpt-oss is a reasoning model); None
+        omits the block and the model uses its own default.
+      * No cache_control blocks are ever sent (they're Anthropic-only); nothing
+        replaces them — Groq/Cerebras prefix-cache automatically server-side.
+      * usage comes back with OpenAI names (prompt_tokens / completion_tokens /
+        prompt_tokens_details.cached_tokens).
+    Raises RuntimeError with a human-readable message on any API/network error —
+    the same contract as call_api(), so callers treat the two identically.
+    """
+    msgs = list(messages)
+    if system:
+        msgs = [{"role": "system", "content": system}] + msgs
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": msgs,
+        "provider": OPENROUTER_PROVIDER,   # pin Groq/Cerebras, no fallbacks
+    }
+    if effort:
+        payload["reasoning"] = {"effort": effort}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        OPENROUTER_URL,
+        data=body,
+        headers={
+            "authorization": f"Bearer {key}",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except Exception:
+            pass
+        # Provider-availability errors need context: we pin two providers with
+        # fallbacks off, so "no providers" means *those two* are down, not the
+        # model — say so instead of leaving a mystery.
+        if "provider" in str(detail).lower():
+            detail = (f"{detail} (note: this setup pins "
+                      f"{'/'.join(OPENROUTER_PROVIDER['only'])} with fallbacks off)")
+        raise RuntimeError(f"API error {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error: {e.reason}")
+
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    text = message.get("content") or ""     # None on some refusals → ""
+    finish = choice.get("finish_reason")
+    refusal = message.get("refusal")
+    if refusal or finish == "content_filter":
+        # OpenAI-format refusal signalling: an explicit message.refusal string
+        # and/or finish_reason "content_filter". Surfaced the same way the
+        # Anthropic path surfaces stop_reason "refusal": marker alone when the
+        # content is empty, appended notice when a partial answer exists.
+        note = refusal or "provider content filter stopped the response"
+        marker = _ansi("2", f"[refused: {note}]")
+        text = f"{text}\n\n{marker}" if text.strip() else marker
+    elif finish == "length":
+        text += _ansi("2", f"\n\n[truncated at {max_tokens} tokens]")
+    usage = data.get("usage") or {}
+    return (text or _ansi("2", "[empty response]")), usage
+
+
+def call_backend(backend, key, model, system, messages, max_tokens=MAX_TOKENS,
+                 cache=False, effort=None):
+    """Route one call to the right API. Not an abstraction over the formats —
+    just the switch, so call sites don't repeat it. `cache` is Anthropic-only
+    (cache_control blocks must never reach OpenRouter; Groq/Cerebras cache
+    prefixes automatically), so it is simply dropped on the OpenRouter path.
+    """
+    if backend == "openrouter":
+        return call_openrouter(key, model, system, messages,
+                               max_tokens=max_tokens, effort=effort)
+    return call_api(key, model, system, messages, max_tokens=max_tokens,
+                    cache=cache, effort=effort)
+
+
+def _print_stats(backend, elapsed, usage):
+    """One dim [stats] line on stderr — never stdout, so piped/tool output stays
+    clean. Requests here are non-streaming, so ttft is the whole request wall
+    time and there is no tokens/sec figure. in/out come from the usage object
+    (field names differ per backend); cached= appears only when the backend
+    reported a cached-token count. Purpose: tune --compact-threshold from data.
+    """
+    if backend == "openrouter":
+        tin = usage.get("prompt_tokens", 0)
+        tout = usage.get("completion_tokens", 0)
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    else:
+        tin = usage.get("input_tokens", 0)
+        tout = usage.get("output_tokens", 0)
+        cached = usage.get("cache_read_input_tokens")
+    line = f"[stats] ttft={elapsed:.2f}s in={tin} out={tout}"
+    if cached is not None:
+        line += f" cached={cached}"
+    # \r + erase first: when `ask` pipes --oneshot into --render, the render
+    # process's spinner may own the current stderr line — clear it so the stats
+    # line never lands appended to a half-drawn spinner frame.
+    prefix = "\r\033[K" if sys.stderr.isatty() else ""
+    print(f"{prefix}{_ansi('2', line)}", file=sys.stderr)
+
+
 def _serialize_transcript(messages):
     """Flatten stored messages into a plain `You:` / `Assistant:` transcript for
     the summarizer. History is stored as string content; the block branch is
@@ -281,7 +427,7 @@ def _serialize_transcript(messages):
     return "\n\n".join(lines)
 
 
-def compact(key, messages, announce_skip=False):
+def compact(key, messages, backend="anthropic", announce_skip=False):
     """Summarize older turns into one synthetic exchange, keeping the recent tail.
 
     Returns a NEW messages list on success, or None when it was skipped (too
@@ -298,10 +444,19 @@ def compact(key, messages, announce_skip=False):
             print(_ansi("2", "chat: not enough history to compact."), file=sys.stderr)
         return None
     keep, evict = messages[-4:], messages[:-4]
+    # Summarize in-backend so the session's one key suffices: Haiku on Anthropic
+    # (no effort param — it rejects one), gpt-oss itself on OpenRouter at low
+    # reasoning effort (a summary needs no deep thinking). gpt-oss's reasoning
+    # tokens share the completion budget, so its cap gets headroom on top of the
+    # 300-400-token summary target.
+    if backend == "openrouter":
+        model, effort, cap = COMPACT_MODEL_OPENROUTER, "low", COMPACT_MAX_TOKENS * 2
+    else:
+        model, effort, cap = COMPACT_MODEL, None, COMPACT_MAX_TOKENS
     try:
-        summary, _ = call_api(key, COMPACT_MODEL, SUMMARIZER_SYS,
-                              [{"role": "user", "content": _serialize_transcript(evict)}],
-                              max_tokens=COMPACT_MAX_TOKENS)
+        summary, _ = call_backend(backend, key, model, SUMMARIZER_SYS,
+                                  [{"role": "user", "content": _serialize_transcript(evict)}],
+                                  max_tokens=cap, effort=effort)
     except RuntimeError as e:
         print(_ansi("2", f"chat: compaction failed ({e}); history unchanged."),
               file=sys.stderr)
@@ -435,14 +590,24 @@ def main():
                    help="generate from --system + prompt args, print raw text, exit")
     p.add_argument("prompt", nargs="*",              # the prompt, in --oneshot mode
                    help="prompt text (--oneshot only; pass after `--`)")
+    p.add_argument("--backend", choices=("anthropic", "openrouter"),
+                   default="anthropic",
+                   help="which API the model id belongs to; the shell layer "
+                        "always passes a matching model/backend pair")
     p.add_argument("--effort", choices=("low", "medium", "high"),
-                   help="output_config.effort for the main model; omit to use the "
-                        "API default (high). The shell layer omits it for Haiku, "
-                        "which rejects the parameter.")
+                   help="thinking-depth dial: Anthropic output_config.effort / "
+                        "OpenRouter reasoning.effort; omit to use the API "
+                        "default. The shell layer omits it for Haiku, which "
+                        "rejects the parameter.")
+    p.add_argument("--stats", action="store_true",
+                   help="print one [stats] line (wall time + token counts) per "
+                        "API call to stderr")
     p.add_argument("--no-compact", action="store_true",  # REPL only
                    help="disable automatic context compaction (/compact still works)")
-    p.add_argument("--compact-threshold", type=int, default=DEFAULT_COMPACT_THRESHOLD,
-                   help="effective-input token threshold that triggers auto-compaction")
+    p.add_argument("--compact-threshold", type=int, default=None,
+                   help="effective-input token threshold that triggers auto-"
+                        "compaction (default 8000, or 35000 on the openrouter "
+                        "backend)")
     args = p.parse_args()
 
     label = MODEL_LABELS.get(args.model, args.model)
@@ -469,20 +634,27 @@ def main():
     # it back through --render. Strip any ANSI the [truncated]/[empty response]
     # markers add so escapes never leak into the Markdown mdcat renders downstream.
     if args.oneshot:
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        key_var = ("OPENROUTER_API_KEY" if args.backend == "openrouter"
+                   else "ANTHROPIC_API_KEY")
+        key = os.environ.get(key_var, "").strip()
         if not key:
-            print("ask: no ANTHROPIC_API_KEY in the environment.", file=sys.stderr)
+            print(f"ask: no {key_var} in the environment.", file=sys.stderr)
             return 1
         prompt = " ".join(args.prompt).strip()
         if not prompt:
             return 0
         try:
-            text, _ = call_api(key, args.model, args.system or "",
-                               [{"role": "user", "content": prompt}],
-                               effort=args.effort)
+            t0 = time.monotonic()
+            text, usage = call_backend(args.backend, key, args.model,
+                                       args.system or "",
+                                       [{"role": "user", "content": prompt}],
+                                       effort=args.effort)
+            elapsed = time.monotonic() - t0
         except RuntimeError as e:
             print(f"ask: {e}", file=sys.stderr)
             return 1
+        if args.stats:
+            _print_stats(args.backend, elapsed, usage)
         text = re.sub(r"\033\[[0-9;]*m", "", text)   # drop marker styling
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         return 0
@@ -491,15 +663,22 @@ def main():
         print("chat: --system is required for the REPL.", file=sys.stderr)
         return 2
 
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    key_var = ("OPENROUTER_API_KEY" if args.backend == "openrouter"
+               else "ANTHROPIC_API_KEY")
+    key = os.environ.get(key_var, "").strip()
     if not key:
-        print("chat: no ANTHROPIC_API_KEY in the environment.", file=sys.stderr)
+        print(f"chat: no {key_var} in the environment.", file=sys.stderr)
         return 1
 
     messages = []       # the entire conversation, re-sent each turn; in memory only.
     last_usage = {}     # usage object from the most recent turn (for /usage + trigger)
     compact_enabled = not args.no_compact
+    # Per-backend default (see the threshold constants); an explicit flag wins.
     compact_threshold = args.compact_threshold
+    if compact_threshold is None:
+        compact_threshold = (OPENROUTER_COMPACT_THRESHOLD
+                             if args.backend == "openrouter"
+                             else DEFAULT_COMPACT_THRESHOLD)
 
     if not MDCAT:
         print("chat: mdcat not found — printing raw Markdown "
@@ -555,6 +734,14 @@ def main():
             if not last_usage:
                 print(_ansi("2", "no usage yet — send a message first."),
                       file=sys.stderr)
+            elif args.backend == "openrouter":
+                # OpenAI usage names; cached comes from prompt_tokens_details
+                # when the provider reports it (Groq does).
+                u = last_usage
+                details = u.get("prompt_tokens_details") or {}
+                print(f"input={u.get('prompt_tokens', 0)}  "
+                      f"output={u.get('completion_tokens', 0)}  "
+                      f"cached={details.get('cached_tokens', 0)}")
             else:
                 u = last_usage
                 print(f"input={u.get('input_tokens', 0)}  "
@@ -565,7 +752,7 @@ def main():
         if msg == "/compact":
             # Manual: runs regardless of threshold, ignores --no-compact, but still
             # honors the "too little history → skip" rule (announced out loud).
-            new = compact(key, messages, announce_skip=True)
+            new = compact(key, messages, backend=args.backend, announce_skip=True)
             if new is not None:
                 messages = new
             continue
@@ -586,13 +773,16 @@ def main():
 
         messages.append({"role": "user", "content": msg})
         try:
-            # The spinner animates on stderr while call_api blocks; the `with` stops
+            # The spinner animates on stderr while the call blocks; the `with` stops
             # and erases it on success, error, and Ctrl-C alike. cache=True marks the
-            # re-sent prefix cacheable (see _with_cache_breakpoint).
+            # re-sent prefix cacheable on the Anthropic path only (see call_backend
+            # and _with_cache_breakpoint).
             with _Spinner(bar_fg):
-                reply, last_usage = call_api(key, args.model, args.system,
-                                             messages, cache=True,
-                                             effort=args.effort)
+                t0 = time.monotonic()
+                reply, last_usage = call_backend(args.backend, key, args.model,
+                                                 args.system, messages,
+                                                 cache=True, effort=args.effort)
+                elapsed = time.monotonic() - t0
         except RuntimeError as e:
             messages.pop()          # drop the unanswered turn → history stays valid
             print(_ansi("2", f"chat: {e}"), file=sys.stderr)
@@ -602,22 +792,29 @@ def main():
             print(_ansi("2", "cancelled."), file=sys.stderr)
             continue
 
+        if args.stats:
+            _print_stats(args.backend, elapsed, last_usage)
         messages.append({"role": "assistant", "content": reply})
         print()                              # space between your line and the reply
         print(model_chip)                    # ` opus ` / ` sonnet ` header chip
         render(reply, bar)
 
         # Auto-compaction. Done AFTER rendering so it never delays the current reply.
-        # effective_input sums the three usage fields that partition the true prompt
-        # size when caching is on (input_tokens alone counts only the uncached part).
         # A successful compaction drops the prompt well below threshold, so it can't
         # re-fire until the conversation grows large again.
         if compact_enabled and last_usage:
-            effective_input = (last_usage.get("input_tokens", 0)
-                               + last_usage.get("cache_read_input_tokens", 0)
-                               + last_usage.get("cache_creation_input_tokens", 0))
+            if args.backend == "openrouter":
+                # OpenAI-format usage: prompt_tokens is the whole prompt, cached
+                # or not, so it IS the effective input.
+                effective_input = last_usage.get("prompt_tokens", 0)
+            else:
+                # These three fields partition the true prompt size when caching
+                # is on (input_tokens alone counts only the uncached part).
+                effective_input = (last_usage.get("input_tokens", 0)
+                                   + last_usage.get("cache_read_input_tokens", 0)
+                                   + last_usage.get("cache_creation_input_tokens", 0))
             if effective_input >= compact_threshold:
-                new = compact(key, messages)
+                new = compact(key, messages, backend=args.backend)
                 if new is not None:
                     messages = new
 
