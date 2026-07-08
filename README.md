@@ -15,7 +15,9 @@ Two zsh functions (`zsh/functions.zsh`; the `chat` REPL is backed by
 
 Flags (same for both): `-f`/`--fable` switches to **Claude Fable 5** (the most
 capable model); `-g`/`--gpt-oss` switches to **gpt-oss-120b** via OpenRouter,
-pinned to the fast Groq/Cerebras providers (cheap and quick); `-v`/`--verbose`
+pinned to the fast Groq/Cerebras providers (cheap and quick); `-x`/`--grok`
+switches to **Grok 4.3** (OpenRouter → xAI); `-d`/`--deepseek` switches to
+**DeepSeek V4 Flash** (OpenRouter; the cheapest option); `-v`/`--verbose`
 gives fuller-but-tight answers and composes with any model flag; `--stats`
 prints dim `[stats]` lines to stderr: `ttft=` (API wall time) and token counts
 (`cached=` when reported), plus `total=` — the full roundtrip from submitting

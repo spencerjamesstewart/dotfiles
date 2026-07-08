@@ -2,7 +2,7 @@
 
 # ask: one-shot question to an LLM.
 # Requires: python3 + an Anthropic API key (see the key file below) — or, for
-# -g, an OpenRouter key in $OPENROUTER_API_KEY; mdcat for the rendered look.
+# -g/-x/-d, an OpenRouter key in $OPENROUTER_API_KEY; mdcat for the rendered look.
 #
 #   ask "..."            one-shot, Sonnet 5 (default), very terse, effort low
 #   ask -h "..."         drop to Haiku 4.5       (--haiku, fastest/cheapest)
@@ -10,6 +10,9 @@
 #   ask -f "..."         escalate to Fable 5     (--fable, most capable)
 #   ask -g "..."         switch to gpt-oss-120b  (--gpt-oss; via OpenRouter,
 #                        pinned to the fast Groq/Cerebras providers)
+#   ask -x "..."         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
+#   ask -d "..."         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
+#                        the cheapest of the lot)
 #   ask -e <level> "..." effort: low (default) | medium | high (--effort) —
 #                        the thinking-depth/token-spend dial (Anthropic
 #                        output_config.effort; OpenRouter reasoning.effort);
@@ -21,9 +24,9 @@
 #                        the full hit-enter → answer-on-screen roundtrip.
 #                        Independent of -v; stderr-only, piped stdout stays clean.
 #
-# Default terseness is model-dependent: Haiku, Sonnet, and gpt-oss get an
-# extra-terse prompt (they run long otherwise); Opus and Fable keep the
-# standard terse one. -v overrides both.
+# Default terseness is model-dependent: Haiku, Sonnet, gpt-oss, and DeepSeek
+# get an extra-terse prompt (they run long otherwise); Opus, Fable, and Grok
+# keep the standard terse one. -v overrides both.
 #
 # In an interactive shell the answer is Markdown-RENDERED through chat's backend —
 # same look as `chat`: a model badge, a coloured gutter bar, and orange headings
@@ -42,34 +45,39 @@
 #     Multi-turn lives entirely in `chat`, a separate, interactive-only process
 #     with in-memory history.
 #
-# Model ids are real API ids (e.g. claude-sonnet-5, openai/gpt-oss-120b); ask
-# and chat POST directly via bin/chat-repl.py — no llm CLI, no SDKs. The
-# backend rides the model id: openai/* goes to OpenRouter (OpenAI Chat
-# Completions format, keyed by $OPENROUTER_API_KEY — export it in
-# ~/.zshrc.local), everything else to the Anthropic Messages API.
+# Model ids are real API ids (e.g. claude-sonnet-5, openai/gpt-oss-120b,
+# x-ai/grok-4.3, deepseek/deepseek-v4-flash); ask and chat POST directly via
+# bin/chat-repl.py — no llm CLI, no SDKs. The backend rides the model id: a
+# slash means OpenRouter (OpenAI Chat Completions format, keyed by
+# $OPENROUTER_API_KEY — export it in ~/.zshrc.local); Anthropic ids have no
+# slash and go to the Messages API.
 
 # Shared system prompts — single source of truth; the one-shot path (`ask`) and
 # the REPL (`chat`) reuse these verbatim, so there is no copy-paste drift. `chat`
 # passes the chosen one into its Python backend via --system, so the text is
 # never duplicated outside this file.
 # Three tiers:
-#   VERY_TERSE — default for Haiku, Sonnet, and gpt-oss, which run to verbosity
-#                otherwise: the answer and nothing else, one line when possible.
-#   TERSE      — default for Opus and Fable (already well-calibrated): tight but
-#                lightly structured Markdown.
+#   VERY_TERSE — default for Haiku, Sonnet, gpt-oss, and DeepSeek, which run to
+#                verbosity otherwise: the answer and nothing else, one line when
+#                possible.
+#   TERSE      — default for Opus, Fable, and Grok (already well-calibrated):
+#                tight but lightly structured Markdown.
 #   VERBOSE    — -v on any model: fuller but still no filler.
 _ASK_SYS_VERY_TERSE='You are a terminal assistant. Be extremely terse: give only the answer itself, in as few words as it allows — a single line whenever possible. No preamble, no sign-off, no restating the question, no caveats, and no explanation or surrounding context unless explicitly asked. Use Markdown only where it genuinely helps: fenced code blocks with a language tag for commands and code, a short bullet list for several parallel items. Everything else is plain text.'
 _ASK_SYS_TERSE='You are a terminal assistant. Keep answers tight — no preamble, no sign-off, no restating the question, no caveats unless essential. Always format the answer as Markdown, and use light structure where it helps: bullet or numbered lists for multiple items, **bold** for key terms, and fenced code blocks with a language tag for commands and code. Only a genuinely trivial reply — a single word or a short one-liner — should be plain text.'
 _ASK_SYS_VERBOSE='You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Always format the answer as Markdown; wrap code in fenced blocks with a language tag.'
 
 # _ask_default_sys: pick the default system prompt for a model — the very-terse
-# tier for Haiku/Sonnet/gpt-oss, the standard terse tier for everything else.
-# Used by ask and chat when -v wasn't given; the choice must happen AFTER flag
-# parsing, since the model isn't known until then.
+# tier for Haiku/Sonnet/gpt-oss/DeepSeek, the standard terse tier for everything
+# else (Opus, Fable, and Grok are already well-calibrated). Used by ask and chat
+# when -v wasn't given; the choice must happen AFTER flag parsing, since the
+# model isn't known until then.
 _ask_default_sys() {
   case "$1" in
-    claude-haiku-*|claude-sonnet-*|openai/gpt-oss-*) print -r -- "$_ASK_SYS_VERY_TERSE" ;;
-    *)                                               print -r -- "$_ASK_SYS_TERSE" ;;
+    claude-haiku-*|claude-sonnet-*|openai/gpt-oss-*|deepseek/*)
+      print -r -- "$_ASK_SYS_VERY_TERSE" ;;
+    *)
+      print -r -- "$_ASK_SYS_TERSE" ;;
   esac
 }
 
@@ -98,8 +106,9 @@ _anthropic_key() {
 # mode, printing the raw answer. This is what tools call directly,
 # e.g.  ASK_TOOL=anki-ask _ask_oneshot claude-sonnet-5 "$sys" "the prompt"
 # NOTE: <model> must be a real API id (dashes), NOT an llm alias. The backend
-# is inferred from it — openai/* → OpenRouter, anything else → Anthropic — so
-# the tool-facing signature never changes and existing callers stay Anthropic.
+# is inferred from it — a slash (openai/*, x-ai/*, deepseek/*) → OpenRouter,
+# anything else → Anthropic — so the tool-facing signature never changes and
+# existing callers stay Anthropic.
 # Effort rides the ASK_EFFORT env var (low|medium|high; default low) rather than
 # a new positional arg, so existing tool callers keep working unchanged. Haiku
 # doesn't support the effort parameter (the API rejects it with a 400), so it is
@@ -115,7 +124,7 @@ _ask_oneshot() {
   # has its own key source, and the key must travel via the environment only
   # (never argv, which `ps` can see). `--` stops the backend's option parsing,
   # so a prompt starting with `-` is safe.
-  if [[ "$model" == openai/* ]]; then
+  if [[ "$model" == */* ]]; then
     [[ -n "$OPENROUTER_API_KEY" ]] || {
       print -u2 "ask: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
       return 1
@@ -152,6 +161,8 @@ ask() {
       -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;   # escalate to the most capable
       -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # OpenRouter → Groq/Cerebras
+      -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
+      -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
       -e|--effort)
         shift
@@ -171,7 +182,7 @@ ask() {
   # with a 400. Fail loudly on an explicit -e rather than silently ignoring it;
   # without -e, Haiku just runs effort-less (the default can't apply to it).
   if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, or -g."
+    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, -g, -x, or -d."
     return 1
   fi
 
@@ -201,6 +212,9 @@ ask() {
 #   chat -f         escalate to Fable 5     (--fable, most capable)
 #   chat -g         switch to gpt-oss-120b  (--gpt-oss; via OpenRouter,
 #                   pinned to the fast Groq/Cerebras providers)
+#   chat -x         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
+#   chat -d         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
+#                   the cheapest of the lot)
 #   chat -e <level> effort: low (default) | medium | high (--effort); not valid
 #                   with -h (Haiku rejects the parameter)
 #   chat -v         fuller-but-tight answers (--verbose); composes with any model flag
@@ -208,8 +222,8 @@ ask() {
 #                   total (message sent → reply on screen; pager dwell excluded),
 #                   and token counts. stderr-only.
 #
-# Default terseness matches ask: extra-terse for Haiku/Sonnet/gpt-oss, standard
-# terse for Opus/Fable; -v overrides both.
+# Default terseness matches ask: extra-terse for Haiku/Sonnet/gpt-oss/DeepSeek,
+# standard terse for Opus/Fable/Grok; -v overrides both.
 #
 # The startup banner states the model and effort in play for the session.
 #   chat --no-compact           keep the whole history; disable auto-compaction
@@ -258,6 +272,8 @@ chat() {
       -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;    # escalate to the most capable
       -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # OpenRouter → Groq/Cerebras
+      -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
+      -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
       -e|--effort)
         shift
@@ -278,18 +294,18 @@ chat() {
     shift
   done
 
-  # Backend rides the model id, same rule as _ask_oneshot: openai/* → OpenRouter.
+  # Backend rides the model id, same rule as _ask_oneshot: a slash → OpenRouter.
   local backend="anthropic"
-  [[ "$model" == openai/* ]] && backend="openrouter"
+  [[ "$model" == */* ]] && backend="openrouter"
 
-  # No -v → model-dependent default: very terse for Haiku/Sonnet/gpt-oss, terse
-  # for the rest.
+  # No -v → model-dependent default: very terse for Haiku/Sonnet/gpt-oss/
+  # DeepSeek, terse for the rest.
   [[ -n "$sys" ]] || sys="$(_ask_default_sys "$model")"
 
   # Same rule as ask: Haiku has no effort parameter, so an explicit -e is an
   # error (the API would reject it), and the low default is simply not sent.
   if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, or -g."
+    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, -g, -x, or -d."
     return 1
   fi
   local -a effort_args stats_args

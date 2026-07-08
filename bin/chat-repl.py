@@ -12,8 +12,9 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     external dependencies are python3 (always present) and `mdcat` (rendering).
   * Two backends, two plain code paths. --backend anthropic (default) speaks
     the Messages API via call_api(); --backend openrouter speaks OpenAI Chat
-    Completions via call_openrouter() (used for gpt-oss-120b, pinned to the
-    fast Groq/Cerebras providers). They are deliberately parallel functions,
+    Completions via call_openrouter() (gpt-oss-120b, Grok 4.3, DeepSeek V4
+    Flash; per-model provider pins live in OPENROUTER_PROVIDER). They are
+    deliberately parallel functions,
     not one abstraction — the wire formats differ in enough small ways (system
     placement, response shape, refusal signalling, usage field names) that two
     commented paths stay clearer than a parameterized one. call_backend() is
@@ -58,12 +59,15 @@ MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
 # OpenRouter (the --backend openrouter path; OpenAI Chat Completions format).
-# The provider block pins the fast serving providers and disables fallbacks —
-# predictable speed over availability. The softer alternative is model id
-# "openai/gpt-oss-120b:nitro" with no provider block (OpenRouter then picks a
-# fast provider itself, with fallbacks).
+# OPENROUTER_PROVIDER holds OPTIONAL per-model provider pins: gpt-oss is pinned
+# to the fast serving providers with fallbacks off — predictable speed over
+# availability (the softer alternative is the ":nitro" model-id suffix with no
+# provider block). Models not listed here route freely: Grok is xAI-only anyway,
+# and DeepSeek has a dozen-plus providers OpenRouter can arbitrage.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_PROVIDER = {"only": ["groq", "cerebras"], "allow_fallbacks": False}
+OPENROUTER_PROVIDER = {
+    "openai/gpt-oss-120b": {"only": ["groq", "cerebras"], "allow_fallbacks": False},
+}
 
 # Auto-compaction (REPL only). When the effective prompt size crosses the
 # threshold, older turns are summarized by a cheap one-shot into a single
@@ -98,6 +102,8 @@ MODEL_LABELS = {
     "claude-opus-4-8": "opus",
     "claude-haiku-4-5": "haiku",
     "openai/gpt-oss-120b": "gpt-oss",
+    "x-ai/grok-4.3": "grok",
+    "deepseek/deepseek-v4-flash": "deepseek",
 }
 
 # Per-turn styling. Each speaker gets a reverse-video "chip" — a padded label on a
@@ -111,9 +117,10 @@ YOU_SGR = "1;97;42"     # your turn: bold white on green
 GUTTER = "▌"            # the bar glyph; one cell + one space = a 2-col gutter
 
 # model id → (chip SGR, gutter-bar fg). Magenta = the escalated most-capable
-# model (fable), blue = sonnet, yellow = the non-Anthropic guest (gpt-oss); all
-# are distinct from your green chip so human and assistant never blur together.
-# The fallback covers any unlisted model.
+# model (fable), blue = sonnet; the non-Anthropic guests take the remaining
+# palette (yellow = gpt-oss, white = grok, red = deepseek); all are distinct
+# from your green chip so human and assistant never blur together. The fallback
+# covers any unlisted model.
 ACCENTS = {
     "claude-sonnet-5":   ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
     "claude-fable-5":    ("1;97;45", "95"),   # white-on-magenta chip, bright-magenta bar
@@ -121,6 +128,8 @@ ACCENTS = {
     "claude-sonnet-4-6": ("1;97;44", "94"),   # white-on-blue    chip, bright-blue    bar
     "claude-haiku-4-5":  ("1;30;46", "96"),   # black-on-cyan    chip, bright-cyan    bar
     "openai/gpt-oss-120b": ("1;30;43", "93"), # black-on-yellow  chip, bright-yellow  bar
+    "x-ai/grok-4.3":     ("1;30;47", "97"),   # black-on-white   chip, bright-white   bar
+    "deepseek/deepseek-v4-flash": ("1;97;41", "91"),  # white-on-red chip, bright-red bar
 }
 DEFAULT_ACCENT = ("1;97;45", "95")
 
@@ -305,10 +314,10 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
       * The reply lives at choices[0].message.content. A reasoning model's
         thinking may arrive alongside it (message.reasoning) and is deliberately
         never read — only the final answer is shown.
-      * `effort` maps to reasoning.effort (gpt-oss is a reasoning model); None
-        omits the block and the model uses its own default.
+      * `effort` maps to reasoning.effort (every model on this backend supports
+        it); None omits the block and the model uses its own default.
       * No cache_control blocks are ever sent (they're Anthropic-only); nothing
-        replaces them — Groq/Cerebras prefix-cache automatically server-side.
+        replaces them — the serving providers prefix-cache automatically.
       * usage comes back with OpenAI names (prompt_tokens / completion_tokens /
         prompt_tokens_details.cached_tokens).
     Raises RuntimeError with a human-readable message on any API/network error —
@@ -321,8 +330,10 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         "model": model,
         "max_tokens": max_tokens,
         "messages": msgs,
-        "provider": OPENROUTER_PROVIDER,   # pin Groq/Cerebras, no fallbacks
     }
+    pin = OPENROUTER_PROVIDER.get(model)   # per-model provider pin, if any
+    if pin:
+        payload["provider"] = pin
     if effort:
         payload["reasoning"] = {"effort": effort}
     body = json.dumps(payload).encode("utf-8")
@@ -344,12 +355,12 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
             detail = json.loads(detail)["error"]["message"]
         except Exception:
             pass
-        # Provider-availability errors need context: we pin two providers with
-        # fallbacks off, so "no providers" means *those two* are down, not the
-        # model — say so instead of leaving a mystery.
-        if "provider" in str(detail).lower():
+        # Provider-availability errors need context when a pin applied: with
+        # fallbacks off, "no providers" means *the pinned ones* are down, not
+        # the model — say so instead of leaving a mystery.
+        if pin and "provider" in str(detail).lower():
             detail = (f"{detail} (note: this setup pins "
-                      f"{'/'.join(OPENROUTER_PROVIDER['only'])} with fallbacks off)")
+                      f"{'/'.join(pin['only'])} with fallbacks off)")
         raise RuntimeError(f"API error {e.code}: {detail}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"network error: {e.reason}")
