@@ -387,12 +387,16 @@ def call_backend(backend, key, model, system, messages, max_tokens=MAX_TOKENS,
                     cache=cache, effort=effort)
 
 
-def _print_stats(backend, elapsed, usage):
+def _print_stats(backend, elapsed, usage, total=None):
     """One dim [stats] line on stderr — never stdout, so piped/tool output stays
     clean. Requests here are non-streaming, so ttft is the whole request wall
-    time and there is no tokens/sec figure. in/out come from the usage object
-    (field names differ per backend); cached= appears only when the backend
-    reported a cached-token count. Purpose: tune --compact-threshold from data.
+    time and there is no tokens/sec figure. `total` is the full roundtrip —
+    message submitted → styled reply ready for the screen — appended when the
+    caller can measure it (the chat REPL can; the one-shot process can't see the
+    downstream render stage, which prints its own total= line instead). in/out
+    come from the usage object (field names differ per backend); cached= appears
+    only when the backend reported a cached-token count. Purpose: tune
+    --compact-threshold from data.
     """
     if backend == "openrouter":
         tin = usage.get("prompt_tokens", 0)
@@ -402,7 +406,10 @@ def _print_stats(backend, elapsed, usage):
         tin = usage.get("input_tokens", 0)
         tout = usage.get("output_tokens", 0)
         cached = usage.get("cache_read_input_tokens")
-    line = f"[stats] ttft={elapsed:.2f}s in={tin} out={tout}"
+    line = f"[stats] ttft={elapsed:.2f}s"
+    if total is not None:
+        line += f" total={total:.2f}s"
+    line += f" in={tin} out={tout}"
     if cached is not None:
         line += f" cached={cached}"
     # \r + erase first: when `ask` pipes --oneshot into --render, the render
@@ -496,10 +503,13 @@ def _restyle_headings(text):
 
 
 def render(text, bar):
-    """Render Markdown via mdcat, draw a gutter bar down the left, then page it.
+    """Render Markdown via mdcat and draw a gutter bar down the left; RETURN the
+    styled text (callers hand it to _page). Returning instead of printing lets
+    callers stop the --stats roundtrip clock at "ready for the screen" — after
+    all styling work, before the pager, whose dwell time belongs to the reader.
 
-    `bar` is the pre-coloured gutter string (e.g. a magenta ▌), or None when stdout
-    isn't a TTY — in which case we skip the gutter and the pager and just print. Any
+    `bar` is the pre-coloured gutter string (e.g. a magenta ▌), or None when
+    stdout isn't a TTY — then the gutter is skipped (and _page just prints). Any
     mdcat/render hiccup falls back to the raw text, so a turn never dies on a
     formatting error.
     """
@@ -523,7 +533,7 @@ def render(text, bar):
     if bar:
         # Prefix EVERY line (blanks included) so the bar is one continuous gutter.
         out = "\n".join(f"{bar} {line}" for line in out.splitlines())
-    _page(out)
+    return out
 
 
 def _page(text):
@@ -581,6 +591,11 @@ def compose_in_editor(seed=""):
 
 
 def main():
+    # Roundtrip clock for --render --stats: this process spawns when the user
+    # hits enter (the ask pipeline starts both stages at once), so main()'s
+    # start is the closest measurable point to "enter" — only the interpreter's
+    # own startup (tens of ms) precedes it.
+    t0 = time.monotonic()
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--model", required=True)
     p.add_argument("--system")                       # required for the REPL only
@@ -626,7 +641,15 @@ def main():
             return 0
         if sys.stdout.isatty():
             print(_chip(label, chip_sgr))
-        render(text, bar)
+        shown = render(text, bar)
+        total = time.monotonic() - t0   # enter → answer ready for the screen
+        _page(shown)
+        if args.stats:
+            # The one-shot process already printed ttft/tokens (it made the API
+            # call); this side owns the rest of the roundtrip — the stdin wait
+            # (= the API call), mdcat, and styling. Printed after the pager so
+            # it lands under the answer; pager dwell is excluded from total.
+            print(_ansi("2", f"[stats] total={total:.2f}s"), file=sys.stderr)
         return 0
 
     # --oneshot: the generate-and-print path for `ask`. POST a single Messages
@@ -771,6 +794,10 @@ def main():
             sep = "\n" if "\n" in msg else " "
             print(f"❯{sep}{msg}")
 
+        # Submit time for --stats total: input()/the editor just returned, so the
+        # clock starts the moment the message is actually sent — time spent
+        # composing in /edit never counts.
+        t_enter = time.monotonic()
         messages.append({"role": "user", "content": msg})
         try:
             # The spinner animates on stderr while the call blocks; the `with` stops
@@ -778,11 +805,11 @@ def main():
             # re-sent prefix cacheable on the Anthropic path only (see call_backend
             # and _with_cache_breakpoint).
             with _Spinner(bar_fg):
-                t0 = time.monotonic()
+                t_api = time.monotonic()
                 reply, last_usage = call_backend(args.backend, key, args.model,
                                                  args.system, messages,
                                                  cache=True, effort=args.effort)
-                elapsed = time.monotonic() - t0
+                elapsed = time.monotonic() - t_api
         except RuntimeError as e:
             messages.pop()          # drop the unanswered turn → history stays valid
             print(_ansi("2", f"chat: {e}"), file=sys.stderr)
@@ -792,12 +819,20 @@ def main():
             print(_ansi("2", "cancelled."), file=sys.stderr)
             continue
 
-        if args.stats:
-            _print_stats(args.backend, elapsed, last_usage)
         messages.append({"role": "assistant", "content": reply})
         print()                              # space between your line and the reply
         print(model_chip)                    # ` opus ` / ` sonnet ` header chip
-        render(reply, bar)
+        shown = render(reply, bar)
+        # total = submit → styled reply ready for the screen, so it covers the
+        # API call AND the mdcat/styling work. Measured before the pager: less
+        # paints instantly, but a long reply can sit in it while you read, and
+        # that dwell time is the reader's, not the pipeline's.
+        total = time.monotonic() - t_enter
+        _page(shown)
+        if args.stats:
+            # After the reply on purpose: the line sits under each message, and
+            # never gets buried above a paged answer.
+            _print_stats(args.backend, elapsed, last_usage, total=total)
 
         # Auto-compaction. Done AFTER rendering so it never delays the current reply.
         # A successful compaction drops the prompt well below threshold, so it can't

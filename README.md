@@ -17,8 +17,12 @@ Flags (same for both): `-f`/`--fable` switches to **Claude Fable 5** (the most
 capable model); `-g`/`--gpt-oss` switches to **gpt-oss-120b** via OpenRouter,
 pinned to the fast Groq/Cerebras providers (cheap and quick); `-v`/`--verbose`
 gives fuller-but-tight answers and composes with any model flag; `--stats`
-prints one dim `[stats]` line per API call to stderr (wall time + token counts,
-`cached=` when reported) — independent of `-v`, and piped stdout stays clean.
+prints dim `[stats]` lines to stderr: `ttft=` (API wall time) and token counts
+(`cached=` when reported), plus `total=` — the full roundtrip from submitting
+the message to the reply being on screen (pager dwell excluded). In `chat` it
+is one line under every reply; in interactive `ask` the `total=` line follows
+the rendered answer (only the render stage can time it). Independent of `-v`,
+and piped stdout stays clean.
 `chat` additionally takes `--no-compact` and `--compact-threshold N` (see
 below).
 

@@ -15,9 +15,11 @@
 #                        output_config.effort; OpenRouter reasoning.effort);
 #                        not valid with -h (Haiku rejects the parameter)
 #   ask -v "..."         fuller-but-tight answer (--verbose); composes with any model flag
-#   ask --stats "..."    one dim [stats] line per API call on stderr — wall time
-#                        + token counts (cached= when the backend reports it).
-#                        Independent of -v; stderr-only, so piped stdout stays clean.
+#   ask --stats "..."    dim [stats] lines on stderr: ttft + token counts from
+#                        the API call (cached= when the backend reports it), and
+#                        — interactive only — a total= line under the answer:
+#                        the full hit-enter → answer-on-screen roundtrip.
+#                        Independent of -v; stderr-only, piped stdout stays clean.
 #
 # Default terseness is model-dependent: Haiku, Sonnet, and gpt-oss get an
 # extra-terse prompt (they run long otherwise); Opus and Fable keep the
@@ -179,8 +181,10 @@ ask() {
   # the raw one-shot path untouched, so tool callers and pipelines are unaffected.
   # (Piping into --render naturally buffers the full answer first.)
   if [[ -t 1 && -z "$ASK_TOOL" && -f "$_CHAT_BACKEND" ]] && command -v python3 >/dev/null 2>&1; then
+    # --stats also rides the render stage: it prints the total= roundtrip line
+    # (enter → answer on screen), which only the downstream process can time.
     ASK_EFFORT="$effort" ASK_STATS="$stats" _ask_oneshot "$model" "$sys" "$*" \
-      | python3 "$_CHAT_BACKEND" --render --model "$model"
+      | python3 "$_CHAT_BACKEND" --render --model "$model" ${stats:+--stats}
   else
     ASK_EFFORT="$effort" ASK_STATS="$stats" _ask_oneshot "$model" "$sys" "$*"   # raw — tools/pipes land here
   fi
@@ -200,7 +204,9 @@ ask() {
 #   chat -e <level> effort: low (default) | medium | high (--effort); not valid
 #                   with -h (Haiku rejects the parameter)
 #   chat -v         fuller-but-tight answers (--verbose); composes with any model flag
-#   chat --stats    one dim [stats] line per turn on stderr (wall time + tokens)
+#   chat --stats    one dim [stats] line under every reply: ttft (API wall time),
+#                   total (message sent → reply on screen; pager dwell excluded),
+#                   and token counts. stderr-only.
 #
 # Default terseness matches ask: extra-terse for Haiku/Sonnet/gpt-oss, standard
 # terse for Opus/Fable; -v overrides both.
