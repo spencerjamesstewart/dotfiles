@@ -5,9 +5,12 @@
 # dotfiles repo stays free of credentials.
 
 # --- Secrets ---
+# Required for the default `ask`/`chat` model (gpt-oss-120b via OpenRouter),
+# and for `-g`/`-x`/`-d`.
+export OPENROUTER_API_KEY="sk-or-v1-REPLACE_ME"
+# Needed only for the Claude-model flags: `-s` (Sonnet), `-h` (Haiku),
+# `-o` (Opus), `-f` (Fable).
 export ANTHROPIC_API_KEY="sk-ant-REPLACE_ME"
-# For `ask -g` / `chat -g` (gpt-oss-120b via OpenRouter); optional otherwise.
-# export OPENROUTER_API_KEY="sk-or-v1-REPLACE_ME"
 
 # --- Per-machine overrides (optional) ---
 # export EDITOR="nvim"

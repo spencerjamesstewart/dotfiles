@@ -4,20 +4,25 @@ My personal macOS / zsh configuration, kept modular and version-controlled.
 See `install.sh` and `zsh/`. Secrets live in `~/.zshrc.local` (gitignored),
 not in this repo. License: MIT.
 
+Claude Code config (agents, `CLAUDE.md`, global settings) lives separately in
+[claude-config](https://github.com/spencerjamesstewart/claude-config) (private).
+
 ## ask / chat — terminal LLM helpers
 
 Two zsh functions (`zsh/functions.zsh`; the `chat` REPL is backed by
-`bin/chat-repl.py`), both defaulting to **Claude Sonnet 5**:
+`bin/chat-repl.py`), both defaulting to **gpt-oss-120b** (via OpenRouter):
 
 - `ask "..."` — one-shot question, rendered inline as Markdown (model badge +
   gutter bar). Non-interactive/piped/tool use prints raw Markdown instead.
 - `chat` — interactive, multi-turn REPL with replies rendered via `mdcat`.
 
-Flags (same for both): `-f`/`--fable` switches to **Claude Fable 5** (the most
-capable model); `-g`/`--gpt-oss` switches to **gpt-oss-120b** via OpenRouter,
-pinned to the fast Groq/Cerebras providers (cheap and quick); `-x`/`--grok`
-switches to **Grok 4.3** (OpenRouter → xAI); `-d`/`--deepseek` switches to
-**DeepSeek V4 Flash** (OpenRouter; the cheapest option); `-v`/`--verbose`
+Flags (same for both): `-s`/`--sonnet` switches to **Claude Sonnet 5**
+(balanced speed + intelligence); `-f`/`--fable` switches to **Claude Fable 5**
+(the most capable model); `-g`/`--gpt-oss` switches to **gpt-oss-120b** via
+OpenRouter (same as the default, explicit), pinned to the fast Groq/Cerebras
+providers (cheap and quick); `-x`/`--grok` switches to **Grok 4.3**
+(OpenRouter → xAI); `-d`/`--deepseek` switches to **DeepSeek V4 Flash**
+(OpenRouter; the cheapest option); `-v`/`--verbose`
 gives fuller-but-tight answers and composes with any model flag; `--stats`
 prints dim `[stats]` lines to stderr: `ttft=` (API wall time) and token counts
 (`cached=` when reported), plus `total=` — the full roundtrip from submitting
@@ -32,11 +37,12 @@ Default terseness is model-dependent: Haiku, Sonnet, and gpt-oss get an
 extra-terse system prompt (just the answer, one line when possible); Opus and
 Fable keep the standard terse prompt. `-v` overrides both.
 
-Both call the Anthropic Messages API directly (no `llm` CLI). The key comes from
-`ANTHROPIC_API_KEY`, else `~/.config/anthropic/key` (one line, `chmod 600`).
-`-g` talks to OpenRouter instead (OpenAI Chat Completions format, same
-stdlib-only `urllib` path); its key comes from `OPENROUTER_API_KEY` — export it
-in `~/.zshrc.local`.
+Neither uses the `llm` CLI; both POST directly. By default (and for `-g`/`-x`/
+`-d`) both call OpenRouter (OpenAI Chat Completions format, stdlib-only
+`urllib`); the key comes from `OPENROUTER_API_KEY` — export it in
+`~/.zshrc.local`. `-s`/`-h`/`-o`/`-f` switch to the Anthropic Messages API
+instead; that key comes from `ANTHROPIC_API_KEY`, else `~/.config/anthropic/key`
+(one line, `chmod 600`).
 
 ### chat REPL commands
 

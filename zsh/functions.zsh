@@ -1,15 +1,17 @@
 # Shell functions
 
 # ask: one-shot question to an LLM.
-# Requires: python3 + an Anthropic API key (see the key file below) — or, for
-# -g/-x/-d, an OpenRouter key in $OPENROUTER_API_KEY; mdcat for the rendered look.
+# Requires: python3 + an OpenRouter API key in $OPENROUTER_API_KEY (used by the
+# default and by -g/-x/-d) — or, for -s/-h/-o/-f, an Anthropic API key (see the
+# key file below); mdcat for the rendered look.
 #
-#   ask "..."            one-shot, Sonnet 5 (default), very terse, effort low
+#   ask "..."            one-shot, gpt-oss-120b (default), very terse, effort low
 #   ask -h "..."         drop to Haiku 4.5       (--haiku, fastest/cheapest)
+#   ask -s "..."         switch to Sonnet 5      (--sonnet, balanced speed + intelligence)
 #   ask -o "..."         escalate to Opus 4.8    (--opus)
 #   ask -f "..."         escalate to Fable 5     (--fable, most capable)
-#   ask -g "..."         switch to gpt-oss-120b  (--gpt-oss; via OpenRouter,
-#                        pinned to the fast Groq/Cerebras providers)
+#   ask -g "..."         gpt-oss-120b (--gpt-oss; same as the default, explicit —
+#                        via OpenRouter, pinned to the fast Groq/Cerebras providers)
 #   ask -x "..."         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
 #   ask -d "..."         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
 #                        the cheapest of the lot)
@@ -148,7 +150,7 @@ _ask_oneshot() {
 
 ask() {
   local sys=""                      # resolved after flag parsing (model-dependent)
-  local model="claude-sonnet-5"     # default: balanced speed + intelligence
+  local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
   local stats=""                    # --stats → per-call [stats] line on stderr
 
@@ -158,9 +160,10 @@ ask() {
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
       -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
+      -s|--sonnet)  model="claude-sonnet-5" ;;   # balanced speed + intelligence
       -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;   # escalate to the most capable
-      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # OpenRouter → Groq/Cerebras
+      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # default; explicit alias — OpenRouter → Groq/Cerebras
       -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
       -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
@@ -182,7 +185,7 @@ ask() {
   # with a 400. Fail loudly on an explicit -e rather than silently ignoring it;
   # without -e, Haiku just runs effort-less (the default can't apply to it).
   if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, -g, -x, or -d."
+    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick -s, -o, -f, -g (default), -x, or -d."
     return 1
   fi
 
@@ -203,15 +206,16 @@ ask() {
 
 # chat: interactive, multi-turn LLM REPL with Markdown-RENDERED replies — the
 # readable counterpart to ask's raw one-shot output.
-# Requires: python3 + mdcat. Reuses ask's shared prompts and keys (Anthropic,
-# or $OPENROUTER_API_KEY for -g).
+# Requires: python3 + mdcat. Reuses ask's shared prompts and keys (OpenRouter,
+# used by the default and -g/-x/-d; or Anthropic for -s/-h/-o/-f).
 #
-#   chat            multi-turn, Sonnet 5 (default), terse, effort low
+#   chat            multi-turn, gpt-oss-120b (default), terse, effort low
 #   chat -h         drop to Haiku 4.5       (--haiku, fastest/cheapest)
+#   chat -s         switch to Sonnet 5      (--sonnet, balanced speed + intelligence)
 #   chat -o         escalate to Opus 4.8    (--opus)
 #   chat -f         escalate to Fable 5     (--fable, most capable)
-#   chat -g         switch to gpt-oss-120b  (--gpt-oss; via OpenRouter,
-#                   pinned to the fast Groq/Cerebras providers)
+#   chat -g         gpt-oss-120b (--gpt-oss; same as the default, explicit —
+#                   via OpenRouter, pinned to the fast Groq/Cerebras providers)
 #   chat -x         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
 #   chat -d         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
 #                   the cheapest of the lot)
@@ -260,7 +264,7 @@ chat() {
 
   local sys=""                    # resolved after flag parsing (model-dependent)
   # Real API ids: the backend calls the Messages API (or OpenRouter) directly.
-  local model="claude-sonnet-5"   # default: balanced speed + intelligence
+  local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
   local stats=""                  # --stats → per-turn [stats] line on stderr
   local -a compact_args           # compaction flags forwarded to the backend
@@ -269,9 +273,10 @@ chat() {
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
       -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
+      -s|--sonnet)  model="claude-sonnet-5" ;;   # balanced speed + intelligence
       -o|--opus)    model="claude-opus-4-8" ;;
       -f|--fable)   model="claude-fable-5" ;;    # escalate to the most capable
-      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # OpenRouter → Groq/Cerebras
+      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # default; explicit alias — OpenRouter → Groq/Cerebras
       -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
       -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
@@ -305,7 +310,7 @@ chat() {
   # Same rule as ask: Haiku has no effort parameter, so an explicit -e is an
   # error (the API would reject it), and the low default is simply not sent.
   if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick Sonnet (default), -o, -f, -g, -x, or -d."
+    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick -s, -o, -f, -g (default), -x, or -d."
     return 1
   fi
   local -a effort_args stats_args
@@ -315,11 +320,12 @@ chat() {
   # Cost heads-up only for models pricier than the default (Haiku is cheaper).
   local pricier=""
   case "$model" in
+    claude-sonnet-5) pricier="Sonnet" ;;
     claude-fable-5)  pricier="Fable" ;;
     claude-opus-4-8) pricier="Opus" ;;
   esac
   [[ -n "$pricier" ]] && \
-    print -u2 "chat: heads-up — $pricier costs more per token than the default (Sonnet); prompt caching + auto-compaction soften long-chat cost, but Sonnet is still cheaper."
+    print -u2 "chat: heads-up — $pricier costs more per token than the default (gpt-oss-120b); prompt caching + auto-compaction soften long-chat cost, but gpt-oss-120b is still cheaper."
 
   # Resolve the key per backend and hand it to the Python process via the
   # environment only — never argv (which `ps` can see) or disk.
