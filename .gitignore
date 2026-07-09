@@ -12,3 +12,4 @@
 # Python bytecode (e.g. from bin/chat-repl.py)
 __pycache__/
 *.pyc
+.memory-updates

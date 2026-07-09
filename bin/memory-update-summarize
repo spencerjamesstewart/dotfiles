@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""memory-update-summarize — turn a pushed commit range into a memory-update doc.
+
+This is the engine behind the zsh `git`/`gh` push wrappers (see zsh/functions.zsh):
+after a successful push in an opted-in repo (marker file `.memory-updates` at
+the repo root), the wrapper backgrounds+disowns a call to this script, which
+gathers the pushed commit messages + `diff --stat` shape (deliberately NO raw
+line-level diffs — that would skew a design-level summary toward implementation
+minutiae), asks Spencer's existing `ask` tool to turn that into a short Markdown
+doc, and drops it in ~/Claude/memory-updates/ for later hand-off to Claude.
+
+Design notes:
+  * This is a background job with no terminal to talk to. In normal mode
+    (invoked from the wrappers) it NEVER writes to stdout/stderr, including on
+    every failure path — the only observable side effects of a problem are a
+    line in ERRORS_LOG (or FALLBACK_LOG, if the output dir itself is broken), a
+    macOS notification, and the assembled context preserved under failed/ for
+    later replay via --retry. --retry is the one interactive path: it prints.
+  * `ask` is a zsh function (zsh/functions.zsh), not a PATH binary, so it's
+    invoked as `zsh -c 'source functions.zsh && ask -s -v --file ...'`. That
+    call is wrapped in Popen + a process-group kill on timeout rather than
+    subprocess.run(timeout=): a plain run(timeout=) only signals the zsh
+    child, but `ask`'s non-interactive path execs python3 as a grandchild
+    that holds the stdout pipe open, so the read hangs past the timeout
+    unless the whole process group is killed (see generate_summary).
+  * Verification runs in a fixed order (V1-V8, see the stage names throughout
+    this file); the first failure aborts and logs, except V7 (a missing head
+    hash in the generated text), which is patched mechanically and logged as
+    a warning only.
+  * Stdlib only, mirroring bin/chat-repl.py's zero-dependency approach.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+DOTFILES = Path(__file__).resolve().parent.parent
+# Overridable so failure-path tests can point at a stub functions.zsh without
+# touching the real one.
+FUNCTIONS_ZSH = Path(os.environ.get(
+    "MEMORY_UPDATE_FUNCTIONS_ZSH", str(DOTFILES / "zsh" / "functions.zsh")))
+OUT_DIR = Path.home() / "Claude" / "memory-updates"
+FAILED_DIR = OUT_DIR / "failed"
+ERRORS_LOG = OUT_DIR / ".errors.log"
+FALLBACK_LOG = Path.home() / ".memory-updates.errors.log"
+ASK_TIMEOUT = int(os.environ.get("MEMORY_UPDATE_ASK_TIMEOUT", 120))
+FALLBACK_COMMITS = 20
+MIN_OUTPUT_BYTES = 200
+HEADING_PREFIX = "# Memory update: "
+
+# The prompt handed to `ask --file <context>`. HEADING_PREFIX is spliced in
+# (rather than duplicated) so the one load-bearing literal — V6 checks the
+# model's first line against it — only ever appears once in source. {slug},
+# {date}, {head} are filled in via .format() once the range is known.
+PROMPT_TEMPLATE = (
+    'You are writing a "memory update": a short, design-level summary of recent '
+    'commits in the {slug} repo, to be handed to a future Claude conversation as '
+    'context. Use ONLY the commit messages and diff --stat below -- never invent '
+    'details that are not there. Write for a future design conversation, not a '
+    'code review: prefer why over how. Keep the whole doc under ~300 words.\n\n'
+    'Your response MUST begin with EXACTLY the literal text "' + HEADING_PREFIX +
+    '" as its very first characters -- no preamble, no code fences, no '
+    '"here\'s the summary" lead-in. Produce this structure:\n\n'
+    + HEADING_PREFIX + '<one-line gist of the change> ({date})\n\n'
+    '<1-2 sentence overview: which repo/tool, what changed, why>\n\n'
+    '## What changed\n'
+    '- <design-level bullets: features added/removed, behavior changes, decisions>\n\n'
+    '## Deliberately not done / out of scope\n'
+    '- <things explicitly excluded, only if the commit messages indicate any -- '
+    'omit this whole section if nothing applies>\n\n'
+    '## Notes\n'
+    '- <architecture/decision notes worth remembering; include the head commit '
+    'short hash {head}>\n'
+)
+
+
+# ---------------------------------------------------------------------------
+# Error plumbing: logging, notification, context preservation, and the single
+# fail() choke point every verification stage funnels through.
+# ---------------------------------------------------------------------------
+
+def log_error(slug, stage, reason):
+    """Append one line to ERRORS_LOG; fall back to FALLBACK_LOG (outside the
+    possibly-broken OUT_DIR) if that write itself fails, e.g. the V4 case
+    where OUT_DIR is unwritable and ERRORS_LOG lives inside it."""
+    reason = str(reason)[:300]
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    line = f"{ts} | {slug} | {stage} | {reason}\n"
+    try:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ERRORS_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        try:
+            with open(FALLBACK_LOG, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass  # truly best-effort; nothing left to fall back to
+
+
+def notify(slug, stage):
+    """Best-effort macOS notification. Never lets a notification failure
+    cascade into the caller — this is a courtesy, not a requirement."""
+    slug_s = str(slug).replace('"', "")
+    stage_s = str(stage).replace('"', "")
+    script = f'display notification "memory-update failed for {slug_s} ({stage_s})" with title "memory-updates"'
+    try:
+        subprocess.run(["osascript", "-e", script],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+    except Exception:
+        pass
+
+
+def preserve_context(ctx_path, slug):
+    """Move the assembled context file into FAILED_DIR for later --retry.
+    On a name collision, append -2, -3, ... until free. If the move itself
+    fails, leave the file where it is and log that fact (a supplementary log
+    line alongside the caller's primary failure-stage entry)."""
+    try:
+        FAILED_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        dest = FAILED_DIR / f"{slug}-{ts}.context.txt"
+        n = 2
+        while dest.exists():
+            dest = FAILED_DIR / f"{slug}-{ts}-{n}.context.txt"
+            n += 1
+        shutil.move(str(ctx_path), str(dest))
+    except OSError as e:
+        log_error(slug, "preserve-context",
+                 f"could not move context file, left at {ctx_path}: {e}")
+
+
+def fail(slug, stage, reason, ctx_path=None, retry_mode=False):
+    """Single choke point for every verification-stage failure. Normal mode
+    NEVER prints; --retry (interactive) also prints a human-readable error."""
+    log_error(slug, stage, reason)
+    if not retry_mode and ctx_path:
+        preserve_context(ctx_path, slug)
+    notify(slug, stage)
+    if retry_mode:
+        print(f"memory-update-summarize: {stage}: {reason}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# git helpers + range resolution (V2)
+# ---------------------------------------------------------------------------
+
+def run_git(toplevel, args):
+    return subprocess.run(["git", "-C", str(toplevel)] + args,
+                         capture_output=True, text=True)
+
+
+def resolve_range(toplevel, old_head, slug):
+    """Return (log_args, diff_args, range_label) for the pushed range, or
+    exit(0) silently if the range is empty (nothing new to summarize)."""
+    if old_head:
+        proc = run_git(toplevel, ["rev-list", "--count", f"{old_head}..HEAD"])
+        if proc.returncode == 0:
+            count = proc.stdout.strip()
+            if count == "0":
+                sys.exit(0)
+            log_args = ["log", "--format=%h %s%n%b", f"{old_head}..HEAD"]
+            diff_args = ["diff", "--stat", old_head, "HEAD"]
+            return log_args, diff_args, f"{old_head}..HEAD"
+        # old_head didn't resolve (rewritten/pruned history, bad sha, etc.) —
+        # fall through to the fallback branch below rather than aborting.
+
+    total_proc = run_git(toplevel, ["rev-list", "--count", "HEAD"])
+    if total_proc.returncode != 0:
+        fail(slug, "range",
+             f"git rev-list --count HEAD failed: {total_proc.stderr.strip()[:200]}")
+    total = int(total_proc.stdout.strip())
+    if total == 0:
+        sys.exit(0)
+    n = min(FALLBACK_COMMITS, total)
+    log_args = ["log", "-n", str(n), "--format=%h %s%n%b"]
+    if n < total:
+        diff_base = f"HEAD~{n}"
+    else:
+        # Root-commit case (whole history requested): the empty tree, computed
+        # rather than hardcoded, so this works on SHA-256 repos too.
+        empty_tree_proc = run_git(toplevel, ["hash-object", "-t", "tree", "/dev/null"])
+        if empty_tree_proc.returncode != 0:
+            fail(slug, "range",
+                 f"git hash-object failed: {empty_tree_proc.stderr.strip()[:200]}")
+        diff_base = empty_tree_proc.stdout.strip()
+    diff_args = ["diff", "--stat", diff_base, "HEAD"]
+    return log_args, diff_args, f"last-{n}"
+
+
+# ---------------------------------------------------------------------------
+# Context file assembly (V3)
+# ---------------------------------------------------------------------------
+
+def build_context(toplevel, slug, head, range_label, log_args, diff_args):
+    log_proc = run_git(toplevel, log_args)
+    if log_proc.returncode != 0 or not log_proc.stdout.strip():
+        fail(slug, "context",
+             f"git log failed or empty: {log_proc.stderr.strip()[:200]}")
+    diff_proc = run_git(toplevel, diff_args)
+    if diff_proc.returncode != 0 or not diff_proc.stdout.strip():
+        fail(slug, "context",
+             f"git diff --stat failed or empty: {diff_proc.stderr.strip()[:200]}")
+
+    date = datetime.date.today().isoformat()
+    # Header format is load-bearing: --retry parses these `# key: value` lines
+    # back out.
+    header = "\n".join([
+        "# memory-update context",
+        f"# repo: {slug}",
+        f"# head: {head}",
+        f"# date: {date}",
+        f"# range: {range_label}",
+        "",
+        "## Commit messages (git log)",
+        log_proc.stdout.rstrip("\n"),
+        "",
+        "## Change shape (git diff --stat)",
+        diff_proc.stdout.rstrip("\n"),
+        "",
+    ])
+    tf = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt",
+                                    encoding="utf-8")
+    tf.write(header)
+    tf.close()
+    return tf.name, date
+
+
+# ---------------------------------------------------------------------------
+# Output directory check (V4)
+# ---------------------------------------------------------------------------
+
+def ensure_output_dir(slug, ctx_path, retry_mode=False):
+    """mkdir -p + a real test write/unlink. Runs before the ask call (V5) so a
+    broken output dir never burns an API call."""
+    try:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        test_path = OUT_DIR / f".write-test-{os.getpid()}"
+        with open(test_path, "w", encoding="utf-8") as f:
+            f.write("x")
+        test_path.unlink()
+    except OSError as e:
+        fail(slug, "output-dir", f"output dir not writable: {e}",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+
+
+# ---------------------------------------------------------------------------
+# Generation via `ask` (V5)
+# ---------------------------------------------------------------------------
+
+def generate_summary(slug, ctx_path, head, date, retry_mode):
+    prompt = PROMPT_TEMPLATE.format(slug=slug, date=date, head=head)
+    proc = subprocess.Popen(
+        ["zsh", "-c", 'source "$1" && ask -s -v --file "$2" "$3"',
+         "zsh", str(FUNCTIONS_ZSH), ctx_path, prompt],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=ASK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # A plain run(timeout=) only signals the zsh child; `ask`'s
+        # non-interactive path execs python3 as a grandchild that holds the
+        # stdout pipe open, so the read would hang past the timeout.
+        # start_new_session=True made zsh its own process-group leader, so
+        # killpg on that group actually reaches the grandchild too.
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        proc.communicate()  # reap, discard
+        fail(slug, "timeout", f"ask exceeded {ASK_TIMEOUT}s",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+
+    if proc.returncode != 0:
+        fail(slug, "ask-failed",
+             f"ask exited {proc.returncode}: {stderr.strip()[:300]}",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+    if not stdout.strip():
+        fail(slug, "empty-output", "ask produced no output",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+    return stdout
+
+
+# ---------------------------------------------------------------------------
+# Output sanity (V6) + head-hash warning (V7)
+# ---------------------------------------------------------------------------
+
+def strip_wrapping(text):
+    """Strip leading blank lines and a wrapping ```/```markdown fence pair.
+    Idempotent-safe: a no-op when neither is present."""
+    lines = text.split("\n")
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+    lines = lines[start:]
+    if lines and lines[0].strip() in ("```", "```markdown"):
+        end = len(lines)
+        while end > 0 and lines[end - 1].strip() == "":
+            end -= 1
+        if end > 0 and lines[end - 1].strip() == "```":
+            lines = lines[1:end - 1]
+    return "\n".join(lines)
+
+
+def patch_missing_hash(text, head):
+    """Mechanically append `- Head commit: <hash>` to the ## Notes section (or
+    create one at EOF if absent)."""
+    bullet = f"- Head commit: {head}"
+    match = re.search(r"(?m)^## Notes\s*$", text)
+    if not match:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text + f"\n## Notes\n{bullet}\n"
+    next_heading = re.search(r"(?m)^## ", text[match.end():])
+    if next_heading:
+        insert_pos = match.end() + next_heading.start()
+        before, after = text[:insert_pos], text[insert_pos:]
+        if not before.endswith("\n"):
+            before += "\n"
+        return before + bullet + "\n" + after
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + bullet + "\n"
+
+
+def verify_and_finalize(slug, text, head, ctx_path, retry_mode):
+    stripped = strip_wrapping(text)
+    body = stripped.encode("utf-8")
+    first_line = stripped.split("\n", 1)[0] if stripped else ""
+    if len(body) < MIN_OUTPUT_BYTES or not first_line.startswith(HEADING_PREFIX.rstrip()):
+        fail(slug, "bad-output",
+             "output failed sanity check (too short or missing heading)",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+
+    if head not in stripped:
+        stripped = patch_missing_hash(stripped, head)
+        # Warn-only: logged, but no notify() and no abort — keep going to V8.
+        log_error(slug, "hash-missing",
+                 f"head hash {head} missing from output; appended to Notes")
+
+    return stripped
+
+
+# ---------------------------------------------------------------------------
+# Write the final doc (V8)
+# ---------------------------------------------------------------------------
+
+def write_output(slug, text, ctx_path, retry_mode):
+    """<slug>-YYYY-MM-DD-HHMM.md, retrying with seconds then a -N suffix on
+    collision. O_EXCL so two near-simultaneous runs can never clobber each
+    other's file."""
+    data = text.encode("utf-8")
+    now = datetime.datetime.now()
+
+    def try_write(path):
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return True
+
+    base = now.strftime("%Y-%m-%d-%H%M")
+    path = OUT_DIR / f"{slug}-{base}.md"
+    try:
+        if not try_write(path):
+            base_s = now.strftime("%Y-%m-%d-%H%M%S")
+            path = OUT_DIR / f"{slug}-{base_s}.md"
+            if not try_write(path):
+                n = 2
+                while True:
+                    path = OUT_DIR / f"{slug}-{base_s}-{n}.md"
+                    if try_write(path):
+                        break
+                    n += 1
+    except OSError as e:
+        fail(slug, "write", f"failed writing output file: {e}",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+
+    try:
+        st = os.stat(path)
+        if st.st_size != len(data):
+            fail(slug, "write", "written file size mismatch",
+                 ctx_path=ctx_path, retry_mode=retry_mode)
+    except OSError as e:
+        fail(slug, "write", f"could not stat written file: {e}",
+             ctx_path=ctx_path, retry_mode=retry_mode)
+
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Tooling check (V1)
+# ---------------------------------------------------------------------------
+
+def check_tooling(slug, toplevel, retry_mode):
+    if not FUNCTIONS_ZSH.is_file():
+        fail(slug, "tooling", f"functions.zsh not found at {FUNCTIONS_ZSH}",
+             retry_mode=retry_mode)
+    proc = subprocess.run(
+        ["zsh", "-c", 'source "$1" && typeset -f ask >/dev/null',
+         "zsh", str(FUNCTIONS_ZSH)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        fail(slug, "tooling",
+             f"ask not defined after sourcing functions.zsh: {proc.stderr.strip()[:200]}",
+             retry_mode=retry_mode)
+    if shutil.which("zsh") is None or shutil.which("python3") is None:
+        fail(slug, "tooling", "zsh or python3 not found on PATH",
+             retry_mode=retry_mode)
+    if not retry_mode:
+        proc = subprocess.run(["git", "-C", str(toplevel), "rev-parse", "--git-dir"],
+                             capture_output=True, text=True)
+        if proc.returncode != 0:
+            fail(slug, "tooling", f"not a git repo: {toplevel}", retry_mode=retry_mode)
+
+
+# ---------------------------------------------------------------------------
+# Normal mode: <toplevel> [<old_head>]
+# ---------------------------------------------------------------------------
+
+def run_normal(toplevel, old_head):
+    slug = Path(toplevel).name
+    check_tooling(slug, toplevel, retry_mode=False)
+
+    log_args, diff_args, range_label = resolve_range(toplevel, old_head, slug)
+
+    head_proc = run_git(toplevel, ["rev-parse", "--short", "HEAD"])
+    if head_proc.returncode != 0 or not head_proc.stdout.strip():
+        fail(slug, "context",
+             f"git rev-parse --short HEAD failed: {head_proc.stderr.strip()[:200]}")
+    head = head_proc.stdout.strip()
+
+    ctx_path, date = build_context(toplevel, slug, head, range_label, log_args, diff_args)
+
+    ensure_output_dir(slug, ctx_path)
+
+    text = generate_summary(slug, ctx_path, head, date, retry_mode=False)
+    text = verify_and_finalize(slug, text, head, ctx_path, retry_mode=False)
+    write_output(slug, text, ctx_path, retry_mode=False)
+
+    try:
+        os.unlink(ctx_path)
+    except OSError:
+        pass
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# --retry mode
+# ---------------------------------------------------------------------------
+
+def parse_retry_header(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        print(f"memory-update-summarize: cannot read retry file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    repo = head = date = None
+    for line in content.split("\n")[:20]:  # header lives in the first few lines
+        if line.startswith("# repo:"):
+            repo = line[len("# repo:"):].strip()
+        elif line.startswith("# head:"):
+            head = line[len("# head:"):].strip()
+        elif line.startswith("# date:"):
+            date = line[len("# date:"):].strip()
+    if not repo or not head or not date:
+        print("memory-update-summarize: retry file missing required header "
+              "(# repo: / # head: / # date:)", file=sys.stderr)
+        sys.exit(1)
+    return repo, head, date
+
+
+def run_retry(context_file):
+    slug, head, date = parse_retry_header(context_file)
+
+    check_tooling(slug, None, retry_mode=True)
+    ensure_output_dir(slug, context_file, retry_mode=True)
+    text = generate_summary(slug, context_file, head, date, retry_mode=True)
+    text = verify_and_finalize(slug, text, head, context_file, retry_mode=True)
+    path = write_output(slug, text, context_file, retry_mode=True)
+
+    print(str(path))
+
+    if Path(context_file).resolve().parent == FAILED_DIR.resolve():
+        try:
+            os.unlink(context_file)
+        except OSError:
+            pass
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="memory-update-summarize",
+        description="Summarize a pushed commit range into a memory-update doc.",
+    )
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("toplevel", nargs="?", default=None,
+                       help="repo top-level directory (git rev-parse --show-toplevel)")
+    group.add_argument("--retry", metavar="CONTEXT_FILE",
+                       help="regenerate a summary from a previously saved context file")
+    p.add_argument("old_head", nargs="?", default="",
+                  help="pre-push SHA (empty on first push / no upstream)")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.retry:
+        return run_retry(args.retry)
+    return run_normal(args.toplevel, args.old_head)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

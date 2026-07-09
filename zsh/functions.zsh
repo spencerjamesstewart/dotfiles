@@ -407,6 +407,99 @@ chat() {
   fi
 }
 
+# memory-updates: auto-generate a short, design-level "memory update" doc into
+# ~/Claude/memory-updates/ after each push, for later hand-off to Claude.
+# Requires: python3 (the summarizer, bin/memory-update-summarize); `ask` above,
+# invoked by the summarizer via `zsh -c 'source functions.zsh && ask ...'`
+# (ask is a shell function, not a PATH binary, so it can't be exec'd directly).
+#
+#   memory-updates-init           opt the current repo in (marker + .gitignore)
+#   git push                      transparent; backgrounds a summary on success
+#   gh pr create                  same, when it pushes an unpushed branch
+#   memory-update-summarize --retry <failed-context-file>   regenerate by hand
+#
+# A repo participates iff `.memory-updates` exists at its root (git rev-parse
+# --show-toplevel); `memory-updates-init` creates it and idempotently ignores
+# it. Git has no post-push hook, so push interception is a `git()`/`gh()`
+# shell wrapper instead — shell functions only catch commands typed at the
+# prompt, which is why `gh` (which can push internally) needs its own wrapper
+# rather than relying on the `git()` one.
+#
+# Transparency is the whole point: push/gh's exit code, stdout, stderr, and any
+# interactive prompts (gh prompts before pushing in `pr create`) are completely
+# unaffected — the summarizer runs backgrounded, disowned, and silenced
+# (`&> /dev/null &!`), so a slow or failing summary never delays or pollutes a
+# terminal push. Failures are logged + notified instead (see the summarizer's
+# own header), never surfaced here.
+#
+# v1 limits: only a literal `git push` as $1 is intercepted (e.g. `git -C
+# somewhere push` bypasses the wrapper, since $1 would be `-C`); `@{push}`
+# tracks whichever branch is currently checked out.
+_MEMORY_UPDATE_BACKEND="${${(%):-%x}:A:h:h}/bin/memory-update-summarize"
+
+memory-update-summarize() { python3 "$_MEMORY_UPDATE_BACKEND" "$@" }
+
+memory-updates-init() {
+  local toplevel
+  toplevel=$(command git rev-parse --show-toplevel 2>/dev/null)
+  [[ -n "$toplevel" ]] || {
+    print -u2 "memory-updates-init: not inside a git repo."
+    return 1
+  }
+  touch "$toplevel/.memory-updates"
+
+  local gi="$toplevel/.gitignore"
+  if [[ ! -f "$gi" ]]; then
+    print -- '.memory-updates' > "$gi"
+  elif ! grep -qxF '.memory-updates' "$gi"; then
+    # Fix a missing trailing newline first, so the append doesn't get glued
+    # onto the last existing line. Command substitution strips trailing
+    # newlines, so a non-empty result means the last byte isn't a newline.
+    [[ -s "$gi" && -n "$(tail -c1 "$gi")" ]] && print >> "$gi"
+    print -- '.memory-updates' >> "$gi"
+  fi
+  echo "memory-updates enabled for $toplevel"
+}
+
+git() {
+  if [[ "$1" == "push" ]]; then
+    local toplevel
+    toplevel=$(command git rev-parse --show-toplevel 2>/dev/null)
+    if [[ -n "$toplevel" && -f "$toplevel/.memory-updates" ]]; then
+      # capture the pre-push remote position; may fail (no upstream yet)
+      local old_head
+      old_head=$(command git rev-parse '@{push}' 2>/dev/null)
+      command git "$@"
+      local rc=$?
+      if (( rc == 0 )); then
+        memory-update-summarize "$toplevel" "$old_head" &> /dev/null &!
+      fi
+      return $rc
+    fi
+  fi
+  command git "$@"
+}
+
+gh() {
+  local toplevel
+  toplevel=$(command git rev-parse --show-toplevel 2>/dev/null)
+  if [[ -n "$toplevel" && -f "$toplevel/.memory-updates" ]]; then
+    local old_head
+    old_head=$(command git rev-parse '@{push}' 2>/dev/null)
+    command gh "$@"
+    local rc=$?
+    if (( rc == 0 )); then
+      local new_head
+      new_head=$(command git rev-parse '@{push}' 2>/dev/null)
+      if [[ -n "$new_head" && "$new_head" != "$old_head" ]]; then
+        memory-update-summarize "$toplevel" "$old_head" &> /dev/null &!
+      fi
+    fi
+    return $rc
+  fi
+  command gh "$@"
+}
+
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
 # Usage: scan2pdf homework.pdf page1.jpg page2.jpg   (or scan2pdf homework.pdf *.jpg)
 # Requires: imagemagick (magick) and img2pdf.
