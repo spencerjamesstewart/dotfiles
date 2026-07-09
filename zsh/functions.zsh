@@ -25,6 +25,15 @@
 #                        — interactive only — a total= line under the answer:
 #                        the full hit-enter → answer-on-screen roundtrip.
 #                        Independent of -v; stderr-only, piped stdout stays clean.
+#   ask --file f "..."   prepend a file's contents as context ahead of the
+#                        question (text/Markdown/code as UTF-8, or a PDF via the
+#                        LOCAL `pdftotext` — brew install poppler; no cloud
+#                        parsing, no OCR). Reading/validation happens in the
+#                        Python backend; only the path crosses argv/env. A bad
+#                        path (missing, a directory, an unsupported image/audio/
+#                        video extension, non-UTF-8 binary) fails fast with no
+#                        API call. One file only; --file with no question is an
+#                        error.
 #
 # Default terseness is model-dependent: Haiku, Sonnet, gpt-oss, and DeepSeek
 # get an extra-terse prompt (they run long otherwise); Opus, Fable, and Grok
@@ -116,12 +125,16 @@ _anthropic_key() {
 # doesn't support the effort parameter (the API rejects it with a 400), so it is
 # omitted for claude-haiku-* models regardless of ASK_EFFORT. ASK_STATS=1 (set
 # by ask --stats) turns on the backend's per-call [stats] line — stderr-only.
-# Usage: [ASK_EFFORT=<level>] [ASK_STATS=1] _ask_oneshot <model> <system-prompt> <prompt...>
+# ASK_FILE (set by ask --file) forwards a path to the backend's --file, which
+# does all the reading/validation — only the path crosses this boundary, never
+# file contents, so a huge PDF never risks ARG_MAX.
+# Usage: [ASK_EFFORT=<level>] [ASK_STATS=1] [ASK_FILE=<path>] _ask_oneshot <model> <system-prompt> <prompt...>
 _ask_oneshot() {
   local model="$1" sys="$2"; shift 2
-  local -a effort_args stats_args
+  local -a effort_args stats_args file_args
   [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "${ASK_EFFORT:-low}")
   [[ -n "$ASK_STATS" ]] && stats_args=(--stats)
+  [[ -n "$ASK_FILE" ]] && file_args=(--file "$ASK_FILE")
   # Two parallel invocations rather than one parameterized one: each backend
   # has its own key source, and the key must travel via the environment only
   # (never argv, which `ps` can see). `--` stops the backend's option parsing,
@@ -135,7 +148,7 @@ _ask_oneshot() {
     # forgot the `export`.
     OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
       --oneshot --backend openrouter --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${stats_args[@]}" -- "$*"
+      "${effort_args[@]}" "${stats_args[@]}" "${file_args[@]}" -- "$*"
   else
     local key; key="$(_anthropic_key)"
     [[ -n "$key" ]] || {
@@ -144,7 +157,7 @@ _ask_oneshot() {
     }
     ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
       --oneshot --backend anthropic --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${stats_args[@]}" -- "$*"
+      "${effort_args[@]}" "${stats_args[@]}" "${file_args[@]}" -- "$*"
   fi
 }
 
@@ -153,6 +166,13 @@ ask() {
   local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
   local stats=""                    # --stats → per-call [stats] line on stderr
+  local file=""                     # --file <path> → forwarded as ASK_FILE
+  local -a codes                    # pipestatus snapshot below; declared here —
+                                     # NOT after the pipe — because `local` is
+                                     # itself a command and running one resets
+                                     # $pipestatus before it can be read
+  local code                        # loop var for the snapshot scan (kept out
+                                     # of the interactive shell's namespace)
 
   # Parse leading flags; combinable in any order. All are stateless, so they are
   # honored everywhere — interactive shells and tool callers alike.
@@ -167,6 +187,10 @@ ask() {
       -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
       -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
+      --file)
+        shift
+        [[ -n "$1" ]] || { print -u2 "ask: --file needs a path."; return 1 }
+        file="$1" ;;
       -e|--effort)
         shift
         case "$1" in
@@ -197,10 +221,20 @@ ask() {
   if [[ -t 1 && -z "$ASK_TOOL" && -f "$_CHAT_BACKEND" ]] && command -v python3 >/dev/null 2>&1; then
     # --stats also rides the render stage: it prints the total= roundtrip line
     # (enter → answer on screen), which only the downstream process can time.
-    ASK_EFFORT="$effort" ASK_STATS="$stats" _ask_oneshot "$model" "$sys" "$*" \
+    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$model" "$sys" "$*" \
       | python3 "$_CHAT_BACKEND" --render --model "$model" ${stats:+--stats}
+    # A left-side failure (bad --file, no key, API error) exits the LEFT
+    # command non-zero, but `$?` after a pipeline is the RIGHT command's exit
+    # code by default — which is 0 even when the left side printed an error
+    # and produced no output. $pipestatus holds every stage's code; return the
+    # first non-zero one so a pipeline failure is never reported as success.
+    codes=("${pipestatus[@]}")
+    for code in "${codes[@]}"; do
+      (( code != 0 )) && return $code
+    done
+    return 0
   else
-    ASK_EFFORT="$effort" ASK_STATS="$stats" _ask_oneshot "$model" "$sys" "$*"   # raw — tools/pipes land here
+    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$model" "$sys" "$*"   # raw — tools/pipes land here
   fi
 }
 
@@ -225,6 +259,12 @@ ask() {
 #   chat --stats    one dim [stats] line under every reply: ttft (API wall time),
 #                   total (message sent → reply on screen; pager dwell excluded),
 #                   and token counts. stderr-only.
+#   chat --file f   attach a file's contents as context to the FIRST message
+#                   typed in the session only — not re-sent on later turns (it
+#                   lives on in history from there, like any other turn). Same
+#                   extraction rules as ask --file (text/Markdown/code as UTF-8,
+#                   PDF via local pdftotext). A bad path fails at startup, before
+#                   the REPL opens; the banner shows the attached filename.
 #
 # Default terseness matches ask: extra-terse for Haiku/Sonnet/gpt-oss/DeepSeek,
 # standard terse for Opus/Fable/Grok; -v overrides both.
@@ -267,6 +307,7 @@ chat() {
   local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
   local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
   local stats=""                  # --stats → per-turn [stats] line on stderr
+  local file=""                   # --file <path> → forwarded as --file to the backend
   local -a compact_args           # compaction flags forwarded to the backend
 
   while [[ "$1" == -* ]]; do
@@ -280,6 +321,10 @@ chat() {
       -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
       -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
+      --file)
+        shift
+        [[ -n "$1" ]] || { print -u2 "chat: --file needs a path."; return 1 }
+        file="$1" ;;
       -e|--effort)
         shift
         case "$1" in
@@ -313,9 +358,10 @@ chat() {
     print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick -s, -o, -f, -g (default), -x, or -d."
     return 1
   fi
-  local -a effort_args stats_args
+  local -a effort_args stats_args file_args
   [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "$effort")
   [[ -n "$stats" ]] && stats_args=(--stats)
+  [[ -n "$file" ]] && file_args=(--file "$file")
 
   # Cost heads-up only for models pricier than the default (Haiku is cheaper).
   local pricier=""
@@ -353,11 +399,11 @@ chat() {
     # forgot the `export`.
     OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
       --backend openrouter --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}"
+      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
   else
     ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
       --backend anthropic --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}"
+      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
   fi
 }
 

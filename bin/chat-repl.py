@@ -620,6 +620,77 @@ def compose_in_editor(seed=""):
             pass
 
 
+# --file support (ask/chat). Extensions we explicitly refuse rather than try to
+# decode as text — the model behind these extensions is media, not prose, so a
+# UTF-8 read would just fail with a confusing "invalid byte" error; naming the
+# media type up front is clearer. v1 has no image/audio/video ingestion at all.
+BINARY_MEDIA_EXTS = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
+    ".webp": "image", ".heic": "image", ".bmp": "image", ".tiff": "image",
+    ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".aac": "audio",
+    ".flac": "audio", ".ogg": "audio",
+    ".mp4": "video", ".mov": "video", ".mkv": "video", ".avi": "video",
+    ".webm": "video",
+}
+
+
+def read_file_context(path):
+    """Read `path` and wrap it as a <file> context block for --file.
+
+    Text/Markdown/code extensions (and anything unrecognized) are read as
+    strict UTF-8 — binary files reliably fail that decode, which is the signal
+    we want. PDFs go through the LOCAL `pdftotext` (poppler) — no cloud
+    parsing, no OCR, per the file-flag spec; a scanned/image-heavy PDF still
+    "succeeds" (near-empty text) but earns a stderr warning so the caller isn't
+    silently sending nothing. Known image/audio/video extensions are rejected
+    up front with a clear message instead of an opaque decode error.
+
+    Raises RuntimeError with a human-readable message on any failure; callers
+    (in main()) already have the RuntimeError → "ask:"/"chat:" prefix
+    convention, so nothing here talks to stderr except the near-empty-PDF
+    warning, which is a non-fatal heads-up, not an error.
+    """
+    if not os.path.isfile(path):
+        # Covers both "doesn't exist" and "it's a directory" — one message,
+        # since the fix is the same either way: point at a real file.
+        raise RuntimeError(f"not a readable regular file: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    media = BINARY_MEDIA_EXTS.get(ext)
+    if media:
+        raise RuntimeError(f"{media} files aren't supported yet: {path}")
+
+    if ext == ".pdf":
+        if not shutil.which("pdftotext"):
+            raise RuntimeError(
+                "pdftotext not found — install poppler: brew install poppler")
+        proc = subprocess.run(["pdftotext", path, "-"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"pdftotext failed: {proc.stderr.strip()}")
+        text = proc.stdout
+        if len(re.sub(r"\s", "", text)) < 50:
+            # Not fatal — a thin/scanned PDF still yields whatever text layer
+            # exists (maybe none); let the caller decide whether that's useful.
+            # "warning:" rather than an ask:/chat: prefix — this helper serves
+            # both modes and can't know which one is running.
+            print(_ansi("2", f"warning: {path} extracted almost no text — it "
+                             "may be scanned/image-heavy; OCR isn't supported."),
+                  file=sys.stderr)
+    else:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            raise RuntimeError(
+                f"{path} isn't valid UTF-8 text — binary files aren't supported")
+        except OSError as e:
+            raise RuntimeError(f"can't read {path}: {e}")
+
+    name = os.path.basename(path).replace('"', '\\"')
+    return f'<file name="{name}">\n{text}\n</file>'
+
+
 def main():
     # Roundtrip clock for --render --stats: this process spawns when the user
     # hits enter (the ask pipeline starts both stages at once), so main()'s
@@ -644,6 +715,11 @@ def main():
                         "OpenRouter reasoning.effort; omit to use the API "
                         "default. The shell layer omits it for Haiku, which "
                         "rejects the parameter.")
+    p.add_argument("--file",
+                   help="path to a text/Markdown/code file (or PDF, via local "
+                        "pdftotext) whose contents are injected as context "
+                        "ahead of the message; --oneshot prepends it to the "
+                        "prompt, the REPL attaches it to the first message typed")
     p.add_argument("--stats", action="store_true",
                    help="print one [stats] line (wall time + token counts) per "
                         "API call to stderr")
@@ -654,6 +730,19 @@ def main():
                         "compaction (default 8000, or 35000 on the openrouter "
                         "backend)")
     args = p.parse_args()
+
+    # Resolve --file BEFORE any key check or API call: a bad path should fail
+    # fast and locally, never burn a network round-trip. The oneshot/REPL modes
+    # share one error-message prefix convention (RuntimeError → "ask:"/"chat:"),
+    # picked here by --oneshot since that's the only signal available this early.
+    file_block = None
+    if args.file:
+        prefix = "ask" if args.oneshot else "chat"
+        try:
+            file_block = read_file_context(args.file)
+        except RuntimeError as e:
+            print(f"{prefix}: {e}", file=sys.stderr)
+            return 1
 
     label = MODEL_LABELS.get(args.model, args.model)
     chip_sgr, bar_fg = ACCENTS.get(args.model, DEFAULT_ACCENT)
@@ -695,7 +784,16 @@ def main():
             return 1
         prompt = " ".join(args.prompt).strip()
         if not prompt:
+            if file_block:
+                # A bare --file with no question is almost certainly a mistake
+                # (nothing to answer), and silently no-op'ing would hide it.
+                print("ask: --file needs a question to go with it.", file=sys.stderr)
+                return 1
             return 0
+        if file_block:
+            # File first, question after — a cache-friendly prefix, and reads
+            # naturally as "here's the context, now the question".
+            prompt = file_block + "\n\n" + prompt
         try:
             t0 = time.monotonic()
             text, usage = call_backend(args.backend, key, args.model,
@@ -725,6 +823,8 @@ def main():
 
     messages = []       # the entire conversation, re-sent each turn; in memory only.
     last_usage = {}     # usage object from the most recent turn (for /usage + trigger)
+    pending_file = file_block   # attached to the first message the user actually
+                                 # sends; None once consumed. Set only from --file.
     compact_enabled = not args.no_compact
     # Per-backend default (see the threshold constants); an explicit flag wins.
     compact_threshold = args.compact_threshold
@@ -741,7 +841,8 @@ def main():
     # they honestly say "n/a" rather than implying a level is set.
     effort_note = f" · effort {args.effort}" if args.effort else " · effort n/a"
     compact_note = "" if compact_enabled else " · auto-compact off"
-    print(_ansi("2", f"chat · {label}{effort_note}{compact_note} · "
+    file_note = f" · file: {os.path.basename(args.file)}" if pending_file else ""
+    print(_ansi("2", f"chat · {label}{effort_note}{compact_note}{file_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
                       "commands: /reset /edit /compact /usage"),
           file=sys.stderr)
@@ -829,7 +930,11 @@ def main():
         # clock starts the moment the message is actually sent — time spent
         # composing in /edit never counts.
         t_enter = time.monotonic()
-        messages.append({"role": "user", "content": msg})
+        # Attach the pending --file block to the OUTGOING content, not to `msg`
+        # itself — /edit's echo above already printed the bare `msg`, and later
+        # turns must never re-inject the file (it lives in history from here).
+        outgoing = msg if pending_file is None else pending_file + "\n\n" + msg
+        messages.append({"role": "user", "content": outgoing})
         try:
             # The spinner animates on stderr while the call blocks; the `with` stops
             # and erases it on success, error, and Ctrl-C alike. cache=True marks the
@@ -851,6 +956,11 @@ def main():
             continue
 
         messages.append({"role": "assistant", "content": reply})
+        # Consume the pending file only now — after a confirmed successful
+        # turn. The RuntimeError/KeyboardInterrupt branches above `continue`
+        # before reaching here, so a failed or cancelled first send leaves
+        # pending_file set and the retry still carries the file.
+        pending_file = None
         print()                              # space between your line and the reply
         print(model_chip)                    # ` opus ` / ` sonnet ` header chip
         shown = render(reply, bar)
