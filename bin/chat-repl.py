@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -141,6 +142,49 @@ DEFAULT_ACCENT = ("1;97;45", "95")
 # (rather than letting it `--paginate`) so we can draw the gutter bar ourselves,
 # then page the barred block through `less -RFX` (see render/_page).
 MDCAT = shutil.which("mdcat")
+
+# Width measurement for the adaptive re-render in render(): mdcat undercounts the
+# display width of some glyphs (arrows, superscripts), so we measure its output
+# ourselves and re-render narrower until it fits the gutter budget. Strip SGR AND
+# OSC 8 hyperlinks (mdcat emits them) so the URL payload isn't counted as width.
+_MEASURE_STRIP = re.compile(
+    r'\033\]8;;.*?(?:\033\\|\007)'   # OSC 8 hyperlink open/close (keep visible label)
+    r'|\033\[[0-9;?]*[ -/]*[@-~]'    # any CSI (covers SGR ...m)
+)
+
+
+def _display_width(s):
+    """True terminal display width of one line: ANSI/OSC stripped, combining
+    marks 0, East-Asian wide/full 2, everything else 1 (ambiguous=1, matching
+    how Ghostty renders arrows/superscripts)."""
+    s = _MEASURE_STRIP.sub("", s)
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _max_width(out):
+    return max((_display_width(l) for l in out.splitlines()), default=0)
+
+
+def _mdcat(text, width):
+    """Render markdown through mdcat at the given column width; return raw
+    mdcat stdout, or the untouched text on any non-zero exit / exception."""
+    try:
+        env = {**os.environ, "CLICOLOR_FORCE": "1"}
+        proc = subprocess.run(
+            [MDCAT, "--local", "--columns", str(width), "-"],
+            input=text, text=True, capture_output=True, check=False, env=env,
+        )
+        if proc.returncode == 0:
+            return proc.stdout
+    except Exception:
+        pass
+    return text
+
 
 # Heading restyle. A terminal can't resize text, so mdcat signals heading LEVEL with
 # a run of ┄ glyphs (U+2504) — visually noisy "dots". We rebuild headings instead:
@@ -546,19 +590,24 @@ def render(text, bar):
     out = text
     if MDCAT:
         cols = shutil.get_terminal_size((80, 24)).columns
-        width = max(20, cols - 2)        # leave 2 cols for the "▌ " gutter
-        try:
-            # CLICOLOR_FORCE keeps mdcat's ANSI colour on through the capture pipe
-            # (it would otherwise be free to drop colour when stdout isn't a tty).
-            env = {**os.environ, "CLICOLOR_FORCE": "1"}
-            proc = subprocess.run(
-                [MDCAT, "--local", "--columns", str(width), "-"],
-                input=text, text=True, capture_output=True, check=False, env=env,
-            )
-            if proc.returncode == 0:
-                out = proc.stdout
-        except Exception:
-            pass                          # keep the raw text
+        budget = max(20, cols - 2)        # leave 2 cols for the "▌ " gutter
+        out = _mdcat(text, budget)
+        if _max_width(out) > budget:
+            # mdcat overshot the width (it undercounts some glyphs). Re-render
+            # narrower, shrinking by the measured overshoot, until it fits.
+            budget_render, width, cand = out, budget, out
+            for _ in range(3):
+                width = max(20, width - (_max_width(cand) - budget))
+                cand = _mdcat(text, width)
+                if _max_width(cand) <= budget:
+                    out = cand
+                    break
+                if width == 20:
+                    break
+            else:
+                out = budget_render       # never converged (e.g. a wide table)
+            if _max_width(out) > budget:  # covers the break-on-floor path too
+                out = budget_render       # unwrappable → today's behavior, no worse
     out = _restyle_headings(out)          # ┄-run headings → `#`×level UPPERCASE orange
     if bar:
         # Prefix EVERY line (blanks included) so the bar is one continuous gutter.
