@@ -10,39 +10,32 @@ Claude Code config (agents, `CLAUDE.md`, global settings) lives separately in
 ## ask / chat — terminal LLM helpers
 
 Two zsh functions (`zsh/functions.zsh`; the `chat` REPL is backed by
-`bin/chat-repl.py`), both defaulting to **gpt-oss-120b** (via OpenRouter):
+`bin/chat-repl.py`), both using one model, **deepseek/deepseek-v4.1-flash-1017**
+via OpenRouter, for everything including `chat`'s compaction. There is no model
+selection; the id is defined once in `bin/chat-repl.py`.
 
 - `ask "..."` — one-shot question, rendered inline as Markdown (model badge +
   gutter bar). Non-interactive/piped/tool use prints raw Markdown instead.
 - `chat` — interactive, multi-turn REPL with replies rendered via `mdcat`.
 
-Flags (same for both): `-s`/`--sonnet` switches to **Claude Sonnet 5**
-(balanced speed + intelligence); `-f`/`--fable` switches to **Claude Fable 5**
-(the most capable model); `-g`/`--gpt-oss` switches to **gpt-oss-120b** via
-OpenRouter (same as the default, explicit), pinned to the fast Groq/Cerebras
-providers (cheap and quick); `-x`/`--grok` switches to **Grok 4.3**
-(OpenRouter → xAI); `-d`/`--deepseek` switches to **DeepSeek V4 Flash**
-(OpenRouter; the cheapest option); `-v`/`--verbose`
-gives fuller-but-tight answers and composes with any model flag; `--stats`
-prints dim `[stats]` lines to stderr: `ttft=` (API wall time) and token counts
-(`cached=` when reported), plus `total=` — the full roundtrip from submitting
-the message to the reply being on screen (pager dwell excluded). In `chat` it
-is one line under every reply; in interactive `ask` the `total=` line follows
-the rendered answer (only the render stage can time it). Independent of `-v`,
-and piped stdout stays clean.
-`chat` additionally takes `--no-compact` and `--compact-threshold N` (see
-below).
+Flags (same for both): `-e`/`--effort low|medium|high` sets the thinking depth
+(OpenRouter `reasoning.effort`; default `low`); `-v`/`--verbose` gives
+fuller-but-tight answers; `--file f` attaches a text/Markdown/code file (or a PDF
+via local `pdftotext`) as context; `--stats` prints dim `[stats]` lines to
+stderr: `ttft=` (API wall time) and token counts (`cached=` when reported),
+plus `total=` — the full roundtrip from submitting the message to the reply
+being on screen (pager dwell excluded). In `chat` it is one line under every
+reply; in interactive `ask` the `total=` line follows the rendered answer (only
+the render stage can time it). Independent of `-v`, and piped stdout stays
+clean. `chat` additionally takes `--no-compact` and `--compact-threshold N`
+(see below).
 
-Default terseness is model-dependent: Haiku, Sonnet, and gpt-oss get an
-extra-terse system prompt (just the answer, one line when possible); Opus and
-Fable keep the standard terse prompt. `-v` overrides both.
+The default system prompt is extra-terse (just the answer, one line when
+possible). `-v` swaps it for a fuller-but-tight one.
 
-Neither uses the `llm` CLI; both POST directly. By default (and for `-g`/`-x`/
-`-d`) both call OpenRouter (OpenAI Chat Completions format, stdlib-only
-`urllib`); the key comes from `OPENROUTER_API_KEY` — export it in
-`~/.zshrc.local`. `-s`/`-h`/`-o`/`-f` switch to the Anthropic Messages API
-instead; that key comes from `ANTHROPIC_API_KEY`, else `~/.config/anthropic/key`
-(one line, `chmod 600`).
+Neither uses the `llm` CLI; both POST directly to OpenRouter (OpenAI Chat
+Completions format, stdlib-only `urllib`). The key comes from
+`OPENROUTER_API_KEY` — export it in `~/.zshrc.local`.
 
 ### chat REPL commands
 
@@ -57,8 +50,8 @@ Inside the `chat` REPL:
 - `/reset` — clear the conversation context without leaving the process.
 - `/compact` — summarize older turns now, regardless of the threshold (works even
   under `--no-compact`).
-- `/usage` — print the last turn's token counts (input, output, cache-creation,
-  cache-read; for `-g` it's input, output, cached).
+- `/usage` — print the last turn's token counts (input, output, cached) and the
+  serving provider.
 - `exit` / `quit` / `Ctrl-D` — leave.
 
 Replies render inline; one that overflows the current pane opens in `less`
@@ -70,17 +63,13 @@ is persisted — relaunching `chat` is a clean reset.
 Multi-turn `chat` re-sends the whole history each turn, but keeps it cheap two
 ways:
 
-- **Prompt caching** — the re-sent prefix is marked cacheable, so once a
-  conversation clears the ~1024-token minimum, repeat turns bill the prefix at
-  the cache-read rate (~10% of input price). Check it with `/usage`. Anthropic
-  path only: `-g` sends no `cache_control` blocks — Groq/Cerebras prefix-cache
-  automatically server-side with nothing to configure.
+- **Prompt caching** — the serving providers prefix-cache the re-sent history
+  automatically; nothing to configure. Check `cached` with `/usage`.
 - **Auto-compaction** — once the effective input crosses `--compact-threshold`
-  (default **8000** tokens; **35000** for `-g`, where the motive is interactive
-  latency and prefix-cache hygiene rather than cost), the older turns are
-  summarized into a single block by a cheap one-shot (Haiku on the Anthropic
-  path, gpt-oss itself on `-g`), keeping the last two exchanges verbatim. On by
-  default; `chat --no-compact` disables the automatic trigger (`/compact` still
-  works). Summaries live only in memory — relaunching is still a clean reset.
+  (default **35000** tokens), the older turns are summarized into a single block
+  by the same model at low effort, keeping the last two exchanges verbatim. On
+  by default; `chat --no-compact` disables the automatic trigger (`/compact`
+  still works). Summaries live only in memory — relaunching is still a clean
+  reset.
 
 `ask` is a stateless one-shot and is unaffected by both.

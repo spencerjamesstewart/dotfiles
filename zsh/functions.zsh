@@ -1,25 +1,16 @@
 # Shell functions
 
 # ask: one-shot question to an LLM.
-# Requires: python3 + an OpenRouter API key in $OPENROUTER_API_KEY (used by the
-# default and by -g/-x/-d) — or, for -s/-h/-o/-f, an Anthropic API key (see the
-# key file below); mdcat for the rendered look.
+# Requires: python3 + an OpenRouter API key in $OPENROUTER_API_KEY; mdcat for
+# the rendered look. One model for everything (ask, chat, and chat's
+# compaction): deepseek/deepseek-v4.1-flash-1017 via OpenRouter, defined once as
+# MODEL in bin/chat-repl.py. There is no model selection.
 #
-#   ask "..."            one-shot, gpt-oss-120b (default), very terse, effort low
-#   ask -h "..."         drop to Haiku 4.5       (--haiku, fastest/cheapest)
-#   ask -s "..."         switch to Sonnet 5      (--sonnet, balanced speed + intelligence)
-#   ask -o "..."         escalate to Opus 4.8    (--opus)
-#   ask -f "..."         escalate to Fable 5     (--fable, most capable)
-#   ask -g "..."         gpt-oss-120b (--gpt-oss; same as the default, explicit —
-#                        via OpenRouter, pinned to the fast Groq/Cerebras providers)
-#   ask -x "..."         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
-#   ask -d "..."         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
-#                        the cheapest of the lot)
+#   ask "..."            one-shot, very terse, effort low
 #   ask -e <level> "..." effort: low (default) | medium | high (--effort) —
-#                        the thinking-depth/token-spend dial (Anthropic
-#                        output_config.effort; OpenRouter reasoning.effort);
-#                        not valid with -h (Haiku rejects the parameter)
-#   ask -v "..."         fuller-but-tight answer (--verbose); composes with any model flag
+#                        the thinking-depth/token-spend dial (OpenRouter
+#                        reasoning.effort)
+#   ask -v "..."         fuller-but-tight answer (--verbose)
 #   ask --stats "..."    dim [stats] lines on stderr: ttft + token counts from
 #                        the API call (cached= when the backend reports it), and
 #                        — interactive only — a total= line under the answer:
@@ -35,10 +26,6 @@
 #                        API call. One file only; --file with no question is an
 #                        error.
 #
-# Default terseness is model-dependent: Haiku, Sonnet, gpt-oss, and DeepSeek
-# get an extra-terse prompt (they run long otherwise); Opus, Fable, and Grok
-# keep the standard terse one. -v overrides both.
-#
 # In an interactive shell the answer is Markdown-RENDERED through chat's backend —
 # same look as `chat`: a model badge, a coloured gutter bar, and orange headings
 # (rendering needs the whole answer, so it buffers instead of streaming; a `…` hint
@@ -52,45 +39,23 @@
 #   * _ask_oneshot is a stateless query core with zero session logic. Tools
 #     call it directly, or call plain `ask` — which is just flag-parsing + that.
 #   * No shared or persistent conversation state exists on this path: each call
-#     is an independent Messages API request with nothing on disk to clobber.
+#     is an independent request with nothing on disk to clobber.
 #     Multi-turn lives entirely in `chat`, a separate, interactive-only process
 #     with in-memory history.
 #
-# Model ids are real API ids (e.g. claude-sonnet-5, openai/gpt-oss-120b,
-# x-ai/grok-4.3, deepseek/deepseek-v4-flash); ask and chat POST directly via
-# bin/chat-repl.py — no llm CLI, no SDKs. The backend rides the model id: a
-# slash means OpenRouter (OpenAI Chat Completions format, keyed by
-# $OPENROUTER_API_KEY — export it in ~/.zshrc.local); Anthropic ids have no
-# slash and go to the Messages API.
+# ask and chat POST directly via bin/chat-repl.py — no llm CLI, no SDKs — to
+# OpenRouter (OpenAI Chat Completions format, keyed by $OPENROUTER_API_KEY —
+# export it in ~/.zshrc.local).
 
 # Shared system prompts — single source of truth; the one-shot path (`ask`) and
 # the REPL (`chat`) reuse these verbatim, so there is no copy-paste drift. `chat`
 # passes the chosen one into its Python backend via --system, so the text is
 # never duplicated outside this file.
-# Three tiers:
-#   VERY_TERSE — default for Haiku, Sonnet, gpt-oss, and DeepSeek, which run to
-#                verbosity otherwise: the answer and nothing else, one line when
-#                possible.
-#   TERSE      — default for Opus, Fable, and Grok (already well-calibrated):
-#                tight but lightly structured Markdown.
-#   VERBOSE    — -v on any model: fuller but still no filler.
-_ASK_SYS_VERY_TERSE='You are a terminal assistant. Be extremely terse: give only the answer itself, in as few words as it allows — a single line whenever possible. No preamble, no sign-off, no restating the question, no caveats, and no explanation or surrounding context unless explicitly asked. Use Markdown only where it genuinely helps: fenced code blocks with a language tag for commands and code, a short bullet list for several parallel items. Everything else is plain text.'
-_ASK_SYS_TERSE='You are a terminal assistant. Keep answers tight — no preamble, no sign-off, no restating the question, no caveats unless essential. Always format the answer as Markdown, and use light structure where it helps: bullet or numbered lists for multiple items, **bold** for key terms, and fenced code blocks with a language tag for commands and code. Only a genuinely trivial reply — a single word or a short one-liner — should be plain text.'
+#   DEFAULT — the answer and nothing else, one line when possible (the model
+#             runs to verbosity otherwise).
+#   VERBOSE — -v: fuller but still no filler.
+_ASK_SYS_DEFAULT='You are a terminal assistant. Be extremely terse: give only the answer itself, in as few words as it allows — a single line whenever possible. No preamble, no sign-off, no restating the question, no caveats, and no explanation or surrounding context unless explicitly asked. Use Markdown only where it genuinely helps: fenced code blocks with a language tag for commands and code, a short bullet list for several parallel items. Everything else is plain text.'
 _ASK_SYS_VERBOSE='You are a terminal assistant. Answer very concisely, but completely. No preamble or filler. Always format the answer as Markdown; wrap code in fenced blocks with a language tag.'
-
-# _ask_default_sys: pick the default system prompt for a model — the very-terse
-# tier for Haiku/Sonnet/gpt-oss/DeepSeek, the standard terse tier for everything
-# else (Opus, Fable, and Grok are already well-calibrated). Used by ask and chat
-# when -v wasn't given; the choice must happen AFTER flag parsing, since the
-# model isn't known until then.
-_ask_default_sys() {
-  case "$1" in
-    claude-haiku-*|claude-sonnet-*|openai/gpt-oss-*|deepseek/*)
-      print -r -- "$_ASK_SYS_VERY_TERSE" ;;
-    *)
-      print -r -- "$_ASK_SYS_TERSE" ;;
-  esac
-}
 
 # Absolute path to chat's Python backend, resolved from THIS file's own location
 # (the same idiom zshrc uses to find the repo) so `chat` works regardless of
@@ -98,73 +63,38 @@ _ask_default_sys() {
 # directories up; the backend lives in bin/.
 _CHAT_BACKEND="${${(%):-%x}:A:h:h}/bin/chat-repl.py"
 
-# Anthropic API key file: a single line, chmod 600. An explicit ANTHROPIC_API_KEY
-# in the environment overrides it. (Replaces the old `llm keys` lookup.)
-_ANTHROPIC_KEY_FILE="${ANTHROPIC_KEY_FILE:-$HOME/.config/anthropic/key}"
-
-# _anthropic_key: print the API key — env override first, else the key file's
-# first line. Silent (empty output) if neither is set; callers report the error.
-_anthropic_key() {
-  if [[ -n "$ANTHROPIC_API_KEY" ]]; then
-    print -r -- "$ANTHROPIC_API_KEY"
-  elif [[ -r "$_ANTHROPIC_KEY_FILE" ]]; then
-    local k; read -r k < "$_ANTHROPIC_KEY_FILE" && print -r -- "$k"
-  fi
-}
-
-# _ask_oneshot: the stateless core. Knows nothing about sessions — it resolves
+# _ask_oneshot: the stateless core. Knows nothing about sessions — it checks
 # the key, then POSTs a single request through the Python backend's --oneshot
 # mode, printing the raw answer. This is what tools call directly,
-# e.g.  ASK_TOOL=anki-ask _ask_oneshot claude-sonnet-5 "$sys" "the prompt"
-# NOTE: <model> must be a real API id (dashes), NOT an llm alias. The backend
-# is inferred from it — a slash (openai/*, x-ai/*, deepseek/*) → OpenRouter,
-# anything else → Anthropic — so the tool-facing signature never changes and
-# existing callers stay Anthropic.
+# e.g.  ASK_TOOL=anki-ask _ask_oneshot "$sys" "the prompt"
 # Effort rides the ASK_EFFORT env var (low|medium|high; default low) rather than
-# a new positional arg, so existing tool callers keep working unchanged. Haiku
-# doesn't support the effort parameter (the API rejects it with a 400), so it is
-# omitted for claude-haiku-* models regardless of ASK_EFFORT. ASK_STATS=1 (set
-# by ask --stats) turns on the backend's per-call [stats] line — stderr-only.
+# a positional arg. ASK_STATS=1 (set by ask --stats) turns on the backend's
+# per-call [stats] line — stderr-only.
 # ASK_FILE (set by ask --file) forwards a path to the backend's --file, which
 # does all the reading/validation — only the path crosses this boundary, never
 # file contents, so a huge PDF never risks ARG_MAX.
-# Usage: [ASK_EFFORT=<level>] [ASK_STATS=1] [ASK_FILE=<path>] _ask_oneshot <model> <system-prompt> <prompt...>
+# Usage: [ASK_EFFORT=<level>] [ASK_STATS=1] [ASK_FILE=<path>] _ask_oneshot <system-prompt> <prompt...>
 _ask_oneshot() {
-  local model="$1" sys="$2"; shift 2
-  local -a effort_args stats_args file_args
-  [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "${ASK_EFFORT:-low}")
+  local sys="$1"; shift
+  local -a stats_args file_args
   [[ -n "$ASK_STATS" ]] && stats_args=(--stats)
   [[ -n "$ASK_FILE" ]] && file_args=(--file "$ASK_FILE")
-  # Two parallel invocations rather than one parameterized one: each backend
-  # has its own key source, and the key must travel via the environment only
-  # (never argv, which `ps` can see). `--` stops the backend's option parsing,
-  # so a prompt starting with `-` is safe.
-  if [[ "$model" == */* ]]; then
-    [[ -n "$OPENROUTER_API_KEY" ]] || {
-      print -u2 "ask: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
-      return 1
-    }
-    # Self-assignment exports the key to the child even if ~/.zshrc.local
-    # forgot the `export`.
-    OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
-      --oneshot --backend openrouter --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${stats_args[@]}" "${file_args[@]}" -- "$*"
-  else
-    local key; key="$(_anthropic_key)"
-    [[ -n "$key" ]] || {
-      print -u2 "ask: no Anthropic key — set ANTHROPIC_API_KEY or write it to $_ANTHROPIC_KEY_FILE."
-      return 1
-    }
-    ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
-      --oneshot --backend anthropic --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${stats_args[@]}" "${file_args[@]}" -- "$*"
-  fi
+  [[ -n "$OPENROUTER_API_KEY" ]] || {
+    print -u2 "ask: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
+    return 1
+  }
+  # The key must travel via the environment only (never argv, which `ps` can
+  # see); self-assignment exports it to the child even if ~/.zshrc.local forgot
+  # the `export`. `--` stops the backend's option parsing, so a prompt starting
+  # with `-` is safe.
+  OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
+    --oneshot --system "$sys" --effort "${ASK_EFFORT:-low}" \
+    "${stats_args[@]}" "${file_args[@]}" -- "$*"
 }
 
 ask() {
-  local sys=""                      # resolved after flag parsing (model-dependent)
-  local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
-  local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
+  local sys="$_ASK_SYS_DEFAULT"
+  local effort="low"                # low = terse/fast/cheap; -e raises it
   local stats=""                    # --stats → per-call [stats] line on stderr
   local file=""                     # --file <path> → forwarded as ASK_FILE
   local -a codes                    # pipestatus snapshot below; declared here —
@@ -179,13 +109,6 @@ ask() {
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
-      -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
-      -s|--sonnet)  model="claude-sonnet-5" ;;   # balanced speed + intelligence
-      -o|--opus)    model="claude-opus-4-8" ;;
-      -f|--fable)   model="claude-fable-5" ;;   # escalate to the most capable
-      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # default; explicit alias — OpenRouter → Groq/Cerebras
-      -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
-      -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
       --file)
         shift
@@ -194,24 +117,13 @@ ask() {
       -e|--effort)
         shift
         case "$1" in
-          low|medium|high) effort="$1"; effort_explicit=1 ;;
+          low|medium|high) effort="$1" ;;
           *) print -u2 "ask: -e needs low, medium, or high."; return 1 ;;
         esac ;;
       *) break ;;
     esac
     shift
   done
-
-  # No -v → model-dependent default: very terse for Haiku/Sonnet, terse for the rest.
-  [[ -n "$sys" ]] || sys="$(_ask_default_sys "$model")"
-
-  # Haiku doesn't support the effort parameter — the API rejects the request
-  # with a 400. Fail loudly on an explicit -e rather than silently ignoring it;
-  # without -e, Haiku just runs effort-less (the default can't apply to it).
-  if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "ask: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick -s, -o, -f, -g (default), -x, or -d."
-    return 1
-  fi
 
   # Interactive shell → render the answer with the chat look (badge + gutter bar +
   # headings) via the shared backend's --render mode. Everything else — a tool
@@ -221,8 +133,8 @@ ask() {
   if [[ -t 1 && -z "$ASK_TOOL" && -f "$_CHAT_BACKEND" ]] && command -v python3 >/dev/null 2>&1; then
     # --stats also rides the render stage: it prints the total= roundtrip line
     # (enter → answer on screen), which only the downstream process can time.
-    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$model" "$sys" "$*" \
-      | python3 "$_CHAT_BACKEND" --render --model "$model" ${stats:+--stats}
+    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$sys" "$*" \
+      | python3 "$_CHAT_BACKEND" --render ${stats:+--stats}
     # A left-side failure (bad --file, no key, API error) exits the LEFT
     # command non-zero, but `$?` after a pipeline is the RIGHT command's exit
     # code by default — which is 0 even when the left side printed an error
@@ -234,28 +146,18 @@ ask() {
     done
     return 0
   else
-    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$model" "$sys" "$*"   # raw — tools/pipes land here
+    ASK_EFFORT="$effort" ASK_STATS="$stats" ASK_FILE="$file" _ask_oneshot "$sys" "$*"   # raw — tools/pipes land here
   fi
 }
 
 # chat: interactive, multi-turn LLM REPL with Markdown-RENDERED replies — the
 # readable counterpart to ask's raw one-shot output.
-# Requires: python3 + mdcat. Reuses ask's shared prompts and keys (OpenRouter,
-# used by the default and -g/-x/-d; or Anthropic for -s/-h/-o/-f).
+# Requires: python3 + mdcat. Reuses ask's shared prompts and OpenRouter key; same
+# single model (see ask above).
 #
-#   chat            multi-turn, gpt-oss-120b (default), terse, effort low
-#   chat -h         drop to Haiku 4.5       (--haiku, fastest/cheapest)
-#   chat -s         switch to Sonnet 5      (--sonnet, balanced speed + intelligence)
-#   chat -o         escalate to Opus 4.8    (--opus)
-#   chat -f         escalate to Fable 5     (--fable, most capable)
-#   chat -g         gpt-oss-120b (--gpt-oss; same as the default, explicit —
-#                   via OpenRouter, pinned to the fast Groq/Cerebras providers)
-#   chat -x         switch to Grok 4.3      (--grok; via OpenRouter → xAI)
-#   chat -d         switch to DeepSeek V4 Flash (--deepseek; via OpenRouter,
-#                   the cheapest of the lot)
-#   chat -e <level> effort: low (default) | medium | high (--effort); not valid
-#                   with -h (Haiku rejects the parameter)
-#   chat -v         fuller-but-tight answers (--verbose); composes with any model flag
+#   chat            multi-turn, very terse, effort low
+#   chat -e <level> effort: low (default) | medium | high (--effort)
+#   chat -v         fuller-but-tight answers (--verbose)
 #   chat --stats    one dim [stats] line under every reply: ttft (API wall time),
 #                   total (message sent → reply on screen; pager dwell excluded),
 #                   and token counts. stderr-only.
@@ -266,34 +168,26 @@ ask() {
 #                   PDF via local pdftotext). A bad path fails at startup, before
 #                   the REPL opens; the banner shows the attached filename.
 #
-# Default terseness matches ask: extra-terse for Haiku/Sonnet/gpt-oss/DeepSeek,
-# standard terse for Opus/Fable/Grok; -v overrides both.
-#
-# The startup banner states the model and effort in play for the session.
+# The startup banner states the effort in play for the session.
 #   chat --no-compact           keep the whole history; disable auto-compaction
 #   chat --compact-threshold N  auto-compact once effective input ≥ N tokens
-#                               (default 8000; 35000 for -g, where the motive is
-#                               interactive latency rather than cost)
+#                               (default 35000)
 #
-# Model + verbosity are fixed at launch (mirroring ask's flags). In the REPL:
+# Verbosity and effort are fixed at launch (mirroring ask's flags). In the REPL:
 # `/reset` wipes the context; `/edit` composes in $EDITOR; `/compact` summarizes
 # older turns now; `/usage` prints the last turn's token counts; `exit`/`quit`/
 # Ctrl-D leave. Nothing is written to disk, so relaunching is a clean reset.
 #
-# The backend holds history in memory and re-sends it each turn, but marks the
-# re-sent prefix cacheable (cache-read billing, ~10% of input price) and
-# auto-compacts older turns into a summary once the context crosses the
-# threshold — so long chats stay cheap. Fable still costs more per token than
-# the default (see the heads-up). The cache_control marking is Anthropic-only:
-# the -g path sends none (Groq/Cerebras prefix-cache automatically server-side)
-# and summarizes with gpt-oss itself, so a -g session needs only the one key.
+# The backend holds history in memory and re-sends it each turn; the provider
+# prefix-caches automatically server-side, and older turns are auto-compacted
+# into a summary (by the same model) once the context crosses the threshold, so
+# long chats stay cheap.
 #
 # ISOLATION — like ask, chat must never be startable by a tool, so it is
 # interactive-ONLY: it refuses unless stdin+stdout are a TTY and ASK_TOOL is
 # unset. The backend (bin/chat-repl.py) is a separate process holding its own
-# in-memory history; it shares nothing with the one-shot path. The API key
-# (Anthropic or OpenRouter) is passed via the environment (never argv, which
-# `ps` can see; never to disk).
+# in-memory history; it shares nothing with the one-shot path. The API key is
+# passed via the environment (never argv, which `ps` can see; never to disk).
 chat() {
   # Hard interactive guard — a tool (no TTY and/or ASK_TOOL set) can never reach
   # the REPL; it should be using one-shot `ask` instead.
@@ -302,10 +196,8 @@ chat() {
     return 1
   }
 
-  local sys=""                    # resolved after flag parsing (model-dependent)
-  # Real API ids: the backend calls the Messages API (or OpenRouter) directly.
-  local model="openai/gpt-oss-120b" # default: fast + cheap, via OpenRouter (Groq/Cerebras)
-  local effort="low" effort_explicit=""   # low = terse/fast/cheap; -e raises it
+  local sys="$_ASK_SYS_DEFAULT"
+  local effort="low"              # low = terse/fast/cheap; -e raises it
   local stats=""                  # --stats → per-turn [stats] line on stderr
   local file=""                   # --file <path> → forwarded as --file to the backend
   local -a compact_args           # compaction flags forwarded to the backend
@@ -313,13 +205,6 @@ chat() {
   while [[ "$1" == -* ]]; do
     case "$1" in
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
-      -h|--haiku)   model="claude-haiku-4-5" ;;  # fastest/cheapest
-      -s|--sonnet)  model="claude-sonnet-5" ;;   # balanced speed + intelligence
-      -o|--opus)    model="claude-opus-4-8" ;;
-      -f|--fable)   model="claude-fable-5" ;;    # escalate to the most capable
-      -g|--gpt-oss) model="openai/gpt-oss-120b" ;;  # default; explicit alias — OpenRouter → Groq/Cerebras
-      -x|--grok)    model="x-ai/grok-4.3" ;;        # OpenRouter → xAI
-      -d|--deepseek) model="deepseek/deepseek-v4-flash" ;;  # OpenRouter, cheapest
       --stats)      stats=1 ;;
       --file)
         shift
@@ -328,7 +213,7 @@ chat() {
       -e|--effort)
         shift
         case "$1" in
-          low|medium|high) effort="$1"; effort_explicit=1 ;;
+          low|medium|high) effort="$1" ;;
           *) print -u2 "chat: -e needs low, medium, or high."; return 1 ;;
         esac ;;
       --no-compact) compact_args+=(--no-compact) ;;   # off by request; no short form
@@ -344,67 +229,25 @@ chat() {
     shift
   done
 
-  # Backend rides the model id, same rule as _ask_oneshot: a slash → OpenRouter.
-  local backend="anthropic"
-  [[ "$model" == */* ]] && backend="openrouter"
-
-  # No -v → model-dependent default: very terse for Haiku/Sonnet/gpt-oss/
-  # DeepSeek, terse for the rest.
-  [[ -n "$sys" ]] || sys="$(_ask_default_sys "$model")"
-
-  # Same rule as ask: Haiku has no effort parameter, so an explicit -e is an
-  # error (the API would reject it), and the low default is simply not sent.
-  if [[ "$model" == claude-haiku-* && -n "$effort_explicit" ]]; then
-    print -u2 "chat: -e can't be used with -h — Haiku 4.5 doesn't support the API's effort parameter (the request would be rejected). Drop -e, or pick -s, -o, -f, -g (default), -x, or -d."
-    return 1
-  fi
-  local -a effort_args stats_args file_args
-  [[ "$model" == claude-haiku-* ]] || effort_args=(--effort "$effort")
+  local -a stats_args file_args
   [[ -n "$stats" ]] && stats_args=(--stats)
   [[ -n "$file" ]] && file_args=(--file "$file")
 
-  # Cost heads-up only for models pricier than the default (Haiku is cheaper).
-  local pricier=""
-  case "$model" in
-    claude-sonnet-5) pricier="Sonnet" ;;
-    claude-fable-5)  pricier="Fable" ;;
-    claude-opus-4-8) pricier="Opus" ;;
-  esac
-  [[ -n "$pricier" ]] && \
-    print -u2 "chat: heads-up — $pricier costs more per token than the default (gpt-oss-120b); prompt caching + auto-compaction soften long-chat cost, but gpt-oss-120b is still cheaper."
-
-  # Resolve the key per backend and hand it to the Python process via the
-  # environment only — never argv (which `ps` can see) or disk.
-  local key
-  if [[ "$backend" == openrouter ]]; then
-    [[ -n "$OPENROUTER_API_KEY" ]] || {
-      print -u2 "chat: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
-      return 1
-    }
-  else
-    key="$(_anthropic_key)"
-    [[ -n "$key" ]] || {
-      print -u2 "chat: no Anthropic key — set ANTHROPIC_API_KEY or write it to $_ANTHROPIC_KEY_FILE."
-      return 1
-    }
-  fi
+  [[ -n "$OPENROUTER_API_KEY" ]] || {
+    print -u2 "chat: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
+    return 1
+  }
 
   [[ -f "$_CHAT_BACKEND" ]] || {
     print -u2 "chat: backend not found at $_CHAT_BACKEND"
     return 1
   }
 
-  if [[ "$backend" == openrouter ]]; then
-    # Self-assignment exports the key to the child even if ~/.zshrc.local
-    # forgot the `export`.
-    OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
-      --backend openrouter --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
-  else
-    ANTHROPIC_API_KEY="$key" python3 "$_CHAT_BACKEND" \
-      --backend anthropic --model "$model" --system "$sys" \
-      "${effort_args[@]}" "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
-  fi
+  # Self-assignment hands the key to the Python process via the environment
+  # only, even if ~/.zshrc.local forgot the `export`.
+  OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
+    --system "$sys" --effort "$effort" \
+    "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
 }
 
 # memory-updates: auto-generate a short, design-level "memory update" doc into

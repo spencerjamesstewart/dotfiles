@@ -17,7 +17,7 @@ Design notes:
     macOS notification, and the assembled context preserved under failed/ for
     later replay via --retry. --retry is the one interactive path: it prints.
   * `ask` is a zsh function (zsh/functions.zsh), not a PATH binary, so it's
-    invoked as `zsh -c 'source functions.zsh && ask -s -v --file ...'`. That
+    invoked as `zsh -c 'source functions.zsh && ask -v --file ...'`. That
     call is wrapped in Popen + a process-group kill on timeout rather than
     subprocess.run(timeout=): a plain run(timeout=) only signals the zsh
     child, but `ask`'s non-interactive path execs python3 as a grandchild
@@ -260,7 +260,7 @@ def ensure_output_dir(slug, ctx_path, retry_mode=False):
 def generate_summary(slug, ctx_path, head, date, retry_mode):
     prompt = PROMPT_TEMPLATE.format(slug=slug, date=date, head=head)
     proc = subprocess.Popen(
-        ["zsh", "-c", 'source "$1" && ask -s -v --file "$2" "$3"',
+        ["zsh", "-c", 'source "$1" && ask -v --file "$2" "$3"',
          "zsh", str(FUNCTIONS_ZSH), ctx_path, prompt],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True,
