@@ -11,7 +11,7 @@
 #                        the thinking-depth/token-spend dial (OpenRouter
 #                        reasoning.effort)
 #   ask -v "..."         fuller-but-tight answer (--verbose)
-#   ask --stats "..."    dim [stats] lines on stderr: ttft + token counts from
+#   ask --stats "..."    dim [stats] lines on stderr: latency + token counts from
 #                        the API call (cached= when the backend reports it), and
 #                        — interactive only — a total= line under the answer:
 #                        the full hit-enter → answer-on-screen roundtrip.
@@ -76,7 +76,7 @@ Flags:
   -h, --help          show this help
   -e, --effort LEVEL  thinking depth: low (default) | medium | high
   -v, --verbose       fuller-but-tight answer instead of the terse default
-  --stats             dim [stats] lines on stderr (ttft, tokens, total)
+  --stats             dim [stats] lines on stderr (latency, tokens, total)
   --file PATH         prepend a text/Markdown/code file (or PDF) as context
 
 Requires OPENROUTER_API_KEY (export it in ~/.zshrc.local).
@@ -104,12 +104,14 @@ Flags:
                               first message
   --no-compact                disable automatic history compaction
   --compact-threshold N       auto-compact at N input tokens (default 35000)
+  --no-latency                hide per-reply [latency Ns] footer (on by default)
 
 In the REPL:
   /edit [text]   compose the next message in $EDITOR (multi-line input)
   /reset         clear the conversation context
   /compact       summarize older turns now
   /usage         show the last turn's token counts
+  /system        show the system prompt in use (also printed at startup)
   /paste         queue the clipboard image for the next message
   /detach        drop queued images
   exit, quit     leave (Ctrl-D also works)
@@ -223,7 +225,7 @@ ask() {
 #   chat            multi-turn, very terse, effort low
 #   chat -e <level> effort: low (default) | medium | high (--effort)
 #   chat -v         fuller-but-tight answers (--verbose)
-#   chat --stats    one dim [stats] line under every reply: ttft (API wall time),
+#   chat --stats    one dim [stats] line under every reply: latency (API wall time),
 #                   total (message sent → reply on screen; pager dwell excluded),
 #                   and token counts. stderr-only.
 #   chat --file f   attach a file's contents as context to the FIRST message
@@ -233,17 +235,24 @@ ask() {
 #                   PDF via local pdftotext). A bad path fails at startup, before
 #                   the REPL opens; the banner shows the attached filename.
 #
-# The startup banner states the effort in play for the session.
+# The startup banner states the effort in play for the session (plus an
+# `auto-compact off` / `latency off` note when those flags are given) and is
+# followed by the system prompt in use, as a dim `system · …` block.
 #   chat --no-compact           keep the whole history; disable auto-compaction
 #   chat --compact-threshold N  auto-compact once effective input ≥ N tokens
 #                               (default 35000)
+#   chat --no-latency           hide the dim `[latency Ns]` footer (API wall time,
+#                               stderr-only) printed under every reply by default;
+#                               --stats folds it into its [stats] line instead
 #
 # Verbosity and effort are fixed at launch (mirroring ask's flags). In the REPL:
 # `/reset` wipes the context; `/edit` composes in $EDITOR; `/compact` summarizes
-# older turns now; `/usage` prints the last turn's token counts; `/paste` queues
-# the clipboard image for the next message and `/detach` drops queued images (an
-# image file dragged onto the prompt attaches too; both downscale to 1344px via
-# sips and stay in context); `exit`/`quit`/Ctrl-D leave. Nothing is written to disk, so relaunching is a clean reset.
+# older turns now; `/usage` prints the last turn's token counts; `/system` re-shows
+# the system prompt (no API call); `/paste` queues the clipboard image for the next
+# message and `/detach` drops queued images (an image file dragged onto the prompt
+# attaches too; both downscale to 1344px via sips and stay in context);
+# `exit`/`quit`/Ctrl-D leave. Nothing is written to disk, so relaunching is a clean
+# reset.
 #
 # The backend holds history in memory and re-sends it each turn; the provider
 # prefix-caches automatically server-side, and older turns are auto-compacted
@@ -275,6 +284,7 @@ chat() {
   local stats=""                  # --stats → per-turn [stats] line on stderr
   local file=""                   # --file <path> → forwarded as --file to the backend
   local -a compact_args           # compaction flags forwarded to the backend
+  local -a latency_args           # --no-latency, forwarded to the backend
 
   while [[ "$1" == -* ]]; do
     case "$1" in
@@ -298,6 +308,7 @@ chat() {
           return 1
         }
         compact_args+=(--compact-threshold "$1") ;;
+      --no-latency) latency_args+=(--no-latency) ;;   # no short form
       *) break ;;
     esac
     shift
@@ -321,7 +332,7 @@ chat() {
   # only, even if ~/.zshrc.local forgot the `export`.
   OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
     --system "$sys" --effort "$effort" \
-    "${compact_args[@]}" "${stats_args[@]}" "${file_args[@]}"
+    "${compact_args[@]}" "${latency_args[@]}" "${stats_args[@]}" "${file_args[@]}"
 }
 
 # memory-updates: auto-generate a short, design-level "memory update" doc into

@@ -19,7 +19,11 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     is a clean, cheap reset. `/reset` wipes the context mid-session.
   * Single source of truth for prompts. The system prompt arrives via --system
     (the shared _ASK_SYS_* strings defined in the shell); it is never copied
-    here, so there is no drift.
+    here, so there is no drift. The REPL shows it (a dim `system · …` block) at
+    startup and again on `/system`, so the pre-prompt in effect is never hidden.
+  * Latency. Every reply is followed by a dim `[latency Ns]` footer on stderr
+    (API wall time); `--no-latency` hides it and `--stats` replaces it with the
+    fuller [stats] line.
   * Multi-line input via the editor. libedit (the macOS readline) has no
     bracketed-paste support, so a pasted block submits line by line. `/edit`
     opens $EDITOR to compose or paste a whole message instead (see
@@ -43,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unicodedata
@@ -109,17 +114,18 @@ SUMMARIZER_SYS = (
 # coloured background — so it's unmistakable who is talking; the assistant's reply
 # is additionally bracketed by a coloured gutter bar down its left edge, so the
 # block visibly starts and ends with the bar (the whole point: no more hunting for
-# where a reply begins/ends). Colours are plain SGR codes from the 16-colour
-# palette, so they track the terminal's own theme. Styling is emitted ONLY when
+# where a reply begins/ends). Your chip is a plain 16-colour SGR code, so it tracks
+# the terminal's own theme; the model's chip and bar are fixed truecolor DeepSeek
+# blue (like the truecolor HEAD_SGR below). Styling is emitted ONLY when
 # stdout is a TTY (see _chip / render); piped output stays plain text.
 YOU_SGR = "1;97;42"     # your turn: bold white on green
 GUTTER = "▌"            # the bar glyph; one cell + one space = a 2-col gutter
 
-# The model's chip label and colours — red, distinct from your green chip so
-# human and assistant never blur together.
+# The model's chip label and colours — DeepSeek logo blue (#4D6BFE), distinct from
+# your green chip so human and assistant never blur together.
 LABEL = "deepseek"
-CHIP_SGR = "1;97;41"    # white-on-red chip
-BAR_FG = "91"           # bright-red gutter bar
+CHIP_SGR = "1;97;48;2;77;107;254"   # bold white on DeepSeek blue chip
+BAR_FG = "38;2;77;107;254"          # DeepSeek blue gutter bar + wait spinner
 
 # mdcat invocation: render Markdown read from stdin (`-`); `--local` so a reply
 # can't make us fetch arbitrary remote image URLs. `--columns` reserves room for
@@ -174,9 +180,10 @@ def _mdcat(text, width):
 # Heading restyle. A terminal can't resize text, so mdcat signals heading LEVEL with
 # a run of ┄ glyphs (U+2504) — visually noisy "dots". We rebuild headings instead:
 # `#`×level + UPPERCASE text, in bold Gruvbox bright orange (#fe8019). Orange is the
-# one warm Gruvbox accent not already used by the green/blue/magenta speaker chips or
-# the yellow links/rules, and it has strong contrast on the #282828 background. ┄ is
-# heading-specific (code fences/tables use U+2500), so matching on it is safe.
+# one warm Gruvbox accent not already used by the green (you) / DeepSeek-blue (model)
+# speaker chips or the yellow links/rules, and it has strong contrast on the #282828
+# background. ┄ is heading-specific (code fences/tables use U+2500), so matching on
+# it is safe.
 HEAD_DASH = "┄"                       # U+2504 — mdcat's heading-level marker
 HEAD_SGR = "1;38;2;254;128;25"        # bold + Gruvbox bright orange (truecolor)
 
@@ -364,7 +371,7 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
 
 def _print_stats(elapsed, usage, total=None):
     """One dim [stats] line on stderr — never stdout, so piped/tool output stays
-    clean. Requests here are non-streaming, so ttft is the whole request wall
+    clean. Requests here are non-streaming, so latency is the whole request wall
     time and there is no tokens/sec figure. `total` is the full roundtrip —
     message submitted → styled reply ready for the screen — appended when the
     caller can measure it (the chat REPL can; the one-shot process can't see the
@@ -375,7 +382,7 @@ def _print_stats(elapsed, usage, total=None):
     tin = usage.get("prompt_tokens", 0)
     tout = usage.get("completion_tokens", 0)
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-    line = f"[stats] ttft={elapsed:.2f}s"
+    line = f"[stats] latency={elapsed:.2f}s"
     if total is not None:
         line += f" total={total:.2f}s"
     line += f" in={tin} out={tout}"
@@ -388,6 +395,19 @@ def _print_stats(elapsed, usage, total=None):
     # line never lands appended to a half-drawn spinner frame.
     prefix = "\r\033[K" if sys.stderr.isatty() else ""
     print(f"{prefix}{_ansi('2', line)}", file=sys.stderr)
+
+
+def _print_system(system):
+    """Print the system prompt to stderr as a dim, labelled, word-wrapped block
+    (REPL startup and `/system`). Each line is styled on its own, so a wrapped
+    block never leaves an SGR span open across a line break. Lines never break
+    at a hyphen, so hyphenated words in the prompt stay whole."""
+    label = "system · "
+    lines = textwrap.wrap(system, width=min(shutil.get_terminal_size().columns, 100),
+                          initial_indent=label, subsequent_indent=" " * len(label),
+                          break_on_hyphens=False)
+    for line in lines:
+        print(_ansi("2", line), file=sys.stderr)
 
 
 def _serialize_transcript(messages):
@@ -477,7 +497,7 @@ def render(text, bar):
     callers stop the --stats roundtrip clock at "ready for the screen" — after
     all styling work, before the pager, whose dwell time belongs to the reader.
 
-    `bar` is the pre-coloured gutter string (e.g. a magenta ▌), or None when
+    `bar` is the pre-coloured gutter string (e.g. a blue ▌), or None when
     stdout isn't a TTY — then the gutter is skipped (and _page just prints). Any
     mdcat/render hiccup falls back to the raw text, so a turn never dies on a
     formatting error.
@@ -866,6 +886,8 @@ def main():
     p.add_argument("--compact-threshold", type=int, default=None,
                    help="effective-input token threshold that triggers auto-"
                         "compaction (default 35000)")
+    p.add_argument("--no-latency", action="store_true",  # REPL only
+                   help="hide the per-reply [latency Ns] footer (on by default)")
     args = p.parse_args()
 
     # Resolve --file BEFORE any key check or API call: a bad path should fail
@@ -899,7 +921,7 @@ def main():
         total = time.monotonic() - t0   # enter → answer ready for the screen
         _page(shown)
         if args.stats:
-            # The one-shot process already printed ttft/tokens (it made the API
+            # The one-shot process already printed latency/tokens (it made the API
             # call); this side owns the rest of the roundtrip — the stdin wait
             # (= the API call), mdcat, and styling. Printed after the pager so
             # it lands under the answer; pager dwell is excluded from total.
@@ -967,11 +989,13 @@ def main():
     # Session banner: states the effort in effect (the shell always passes one).
     effort_note = f" · effort {args.effort}" if args.effort else ""
     compact_note = "" if compact_enabled else " · auto-compact off"
+    latency_note = " · latency off" if args.no_latency else ""
     file_note = f" · file: {os.path.basename(args.file)}" if pending_file else ""
-    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{file_note} · "
+    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{file_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
-                      "commands: /reset /edit /compact /usage /paste /detach"),
+                      "commands: /reset /edit /compact /usage /system /paste /detach"),
           file=sys.stderr)
+    _print_system(args.system)
 
     # LABEL / CHIP_SGR / bar are shared with --render (see top of main()).
     # Both speakers get a chip on its OWN line, then their content below: ` you `
@@ -1024,6 +1048,9 @@ def main():
                       f"output={u.get('completion_tokens', 0)}  "
                       f"cached={details.get('cached_tokens', 0)}  "
                       f"provider={u.get('provider', '?').lower()}")
+            continue
+        if msg == "/system":
+            _print_system(args.system)      # no API call, history untouched
             continue
         if msg == "/paste":
             # A slash command rather than a key binding: libedit can't run Python
@@ -1148,6 +1175,9 @@ def main():
             # After the reply on purpose: the line sits under each message, and
             # never gets buried above a paged answer.
             _print_stats(elapsed, last_usage, total=total)
+        elif not args.no_latency:
+            # Default footer (API wall time only); --stats' line already has it.
+            print(_ansi("2", f"[latency {elapsed:.2f}s]"), file=sys.stderr)
 
         # Auto-compaction. Done AFTER rendering so it never delays the current reply.
         # A successful compaction drops the prompt well below threshold, so it can't

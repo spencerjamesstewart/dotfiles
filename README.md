@@ -22,16 +22,20 @@ Flags (same for both): `-e`/`--effort low|medium|high` sets the thinking depth
 (OpenRouter `reasoning.effort`; default `low`); `-v`/`--verbose` gives
 fuller-but-tight answers; `--file f` attaches a text/Markdown/code file (or a PDF
 via local `pdftotext`) as context; `--stats` prints dim `[stats]` lines to
-stderr: `ttft=` (API wall time) and token counts (`cached=` when reported),
+stderr: `latency=` (API wall time) and token counts (`cached=` when reported),
 plus `total=` — the full roundtrip from submitting the message to the reply
 being on screen (pager dwell excluded). In `chat` it is one line under every
 reply; in interactive `ask` the `total=` line follows the rendered answer (only
 the render stage can time it). Independent of `-v`, and piped stdout stays
 clean. `chat` additionally takes `--no-compact` and `--compact-threshold N`
-(see below). `-h`/`--help` prints usage for either.
+(see below), and `--no-latency`. By default each `chat` reply ends with a dim
+`[latency Ns]` footer on stderr (the API wall time; `--stats` replaces it with
+its fuller line), and `--no-latency` hides it. `-h`/`--help` prints usage for
+either.
 
 The default system prompt is extra-terse (just the answer, one line when
-possible). `-v` swaps it for a fuller-but-tight one.
+possible). `-v` swaps it for a fuller-but-tight one. `chat` prints the prompt in
+use as a dim `system · …` block at startup, and `/system` shows it again.
 
 Neither uses the `llm` CLI; both POST directly to OpenRouter (OpenAI Chat
 Completions format, stdlib-only `urllib`). The key comes from
@@ -52,6 +56,8 @@ Inside the `chat` REPL:
   under `--no-compact`).
 - `/usage` — print the last turn's token counts (input, output, cached) and the
   serving provider.
+- `/system` — re-print the system prompt in use (it is also shown at startup);
+  makes no API request.
 - `/paste` — queue the clipboard image (Finder-copied file, screenshot) for the
   next message; type your text after it. `/detach` drops queued images.
 - `exit` / `quit` / `Ctrl-D` — leave.
