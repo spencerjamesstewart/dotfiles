@@ -79,7 +79,8 @@ ways:
   (default **35000** tokens), the older turns are summarized into a single block
   by the same model at low effort, keeping the last two exchanges verbatim. On
   by default; `chat --no-compact` disables the automatic trigger (`/compact`
-  still works). Summaries live only in memory — relaunching is still a clean
-  reset.
+  still works). A summary that comes back empty, refused or truncated is
+  rejected and history is left unchanged. Summaries live only in memory —
+  relaunching is still a clean reset.
 
 `ask` is a stateless one-shot and is unaffected by both.

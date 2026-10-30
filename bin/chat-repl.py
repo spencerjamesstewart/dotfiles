@@ -251,7 +251,7 @@ def _wire_message(m):
 
 
 def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
-                    effort=None):
+                    effort=None, strict=False):
     """POST the whole conversation to OpenRouter; return (assistant_text, usage).
 
     Speaks OpenAI Chat Completions format:
@@ -261,6 +261,9 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         never read — only the final answer is shown.
       * `effort` maps to reasoning.effort; None omits the block and the model
         uses its own default.
+      * `strict=True` raises RuntimeError instead of returning marker text for a
+        refused, truncated or empty reply — for callers (compaction) that can't
+        use such a reply as real content.
       * No cache markers are sent — the serving providers prefix-cache
         automatically.
       * Routing: always `provider.sort = latency`. If ANY message in the list has
@@ -332,11 +335,21 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
     text = message.get("content") or ""     # None on some refusals → ""
     finish = choice.get("finish_reason")
     refusal = message.get("refusal")
+    note = refusal or "provider content filter stopped the response"
+    if strict:
+        # Raise instead of returning marker text, so a caller that needs real
+        # content (compaction) can't mistake a marker for it. Same precedence
+        # as the marker branches below.
+        if refusal or finish == "content_filter":
+            raise RuntimeError(f"reply refused: {note}")
+        if finish == "length":
+            raise RuntimeError(f"reply truncated at {max_tokens} tokens")
+        if not text.strip():
+            raise RuntimeError("empty reply")
     if refusal or finish == "content_filter":
         # OpenAI-format refusal signalling: an explicit message.refusal string
         # and/or finish_reason "content_filter". Marker alone when the content
         # is empty, appended notice when a partial answer exists.
-        note = refusal or "provider content filter stopped the response"
         marker = _ansi("2", f"[refused: {note}]")
         text = f"{text}\n\n{marker}" if text.strip() else marker
     elif finish == "length":
@@ -418,7 +431,8 @@ def compact(key, messages, announce_skip=False):
     try:
         summary, _ = call_openrouter(key, MODEL, SUMMARIZER_SYS,
                                      [{"role": "user", "content": _serialize_transcript(evict)}],
-                                     max_tokens=COMPACT_MAX_TOKENS * 2, effort="low")
+                                     max_tokens=COMPACT_MAX_TOKENS * 2, effort="low",
+                                     strict=True)   # marker text must never become the summary
     except RuntimeError as e:
         print(_ansi("2", f"chat: compaction failed ({e}); history unchanged."),
               file=sys.stderr)
