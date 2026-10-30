@@ -63,6 +63,70 @@ _ASK_SYS_VERBOSE='You are a terminal assistant. Answer very concisely, but compl
 # directories up; the backend lives in bin/.
 _CHAT_BACKEND="${${(%):-%x}:A:h:h}/bin/chat-repl.py"
 
+# _ask_help / _chat_help: the single source of each command's --help text.
+# Plain text to stdout; handled before any TTY/key checks, so no network, key,
+# or terminal is needed. Keep in sync with the flag lists in the headers above.
+_ask_help() {
+  cat <<'EOF'
+Usage: ask [flags] "question"
+
+One-shot question to an LLM (deepseek via OpenRouter).
+
+Flags:
+  -h, --help          show this help
+  -e, --effort LEVEL  thinking depth: low (default) | medium | high
+  -v, --verbose       fuller-but-tight answer instead of the terse default
+  --stats             dim [stats] lines on stderr (ttft, tokens, total)
+  --file PATH         prepend a text/Markdown/code file (or PDF) as context
+
+Requires OPENROUTER_API_KEY (export it in ~/.zshrc.local).
+Output is Markdown-rendered in a terminal, raw when piped or ASK_TOOL is set.
+
+Examples:
+  ask "tar flags to extract a .tgz"
+  ask -e high --file notes.md "summarize the open questions"
+EOF
+}
+
+_chat_help() {
+  cat <<'EOF'
+Usage: chat [flags]
+
+Interactive multi-turn LLM REPL with Markdown-rendered replies.
+Interactive terminals only; tools should use `ask`.
+
+Flags:
+  -h, --help                  show this help
+  -e, --effort LEVEL          thinking depth: low (default) | medium | high
+  -v, --verbose               fuller-but-tight answers instead of terse
+  --stats                     dim [stats] line under every reply
+  --file PATH                 attach a text/Markdown/code file (or PDF) to the
+                              first message
+  --no-compact                disable automatic history compaction
+  --compact-threshold N       auto-compact at N input tokens (default 35000)
+
+In the REPL:
+  /edit [text]   compose the next message in $EDITOR (multi-line input)
+  /reset         clear the conversation context
+  /compact       summarize older turns now
+  /usage         show the last turn's token counts
+  /paste         queue the clipboard image for the next message
+  /detach        drop queued images
+  exit, quit     leave (Ctrl-D also works)
+
+Images: drag an image file onto the prompt (PNG, JPEG, GIF, WebP, HEIC) or use
+/paste. Images are downscaled locally to 1344px on the long side, shown as
+`attached:` lines (dragged ones ask `send? [Y/n]`), and stay in context for
+later turns. Image requests use a provider allowlist (IMAGE_PROVIDERS in
+bin/chat-repl.py).
+
+Requires OPENROUTER_API_KEY (export it in ~/.zshrc.local).
+
+Example:
+  chat -e medium --file spec.md
+EOF
+}
+
 # _ask_oneshot: the stateless core. Knows nothing about sessions — it checks
 # the key, then POSTs a single request through the Python backend's --oneshot
 # mode, printing the raw answer. This is what tools call directly,
@@ -108,6 +172,7 @@ ask() {
   # honored everywhere — interactive shells and tool callers alike.
   while [[ "$1" == -* ]]; do
     case "$1" in
+      -h|--help)    _ask_help; return 0 ;;
       -v|--verbose) sys="$_ASK_SYS_VERBOSE" ;;
       --stats)      stats=1 ;;
       --file)
@@ -175,8 +240,10 @@ ask() {
 #
 # Verbosity and effort are fixed at launch (mirroring ask's flags). In the REPL:
 # `/reset` wipes the context; `/edit` composes in $EDITOR; `/compact` summarizes
-# older turns now; `/usage` prints the last turn's token counts; `exit`/`quit`/
-# Ctrl-D leave. Nothing is written to disk, so relaunching is a clean reset.
+# older turns now; `/usage` prints the last turn's token counts; `/paste` queues
+# the clipboard image for the next message and `/detach` drops queued images (an
+# image file dragged onto the prompt attaches too; both downscale to 1344px via
+# sips and stay in context); `exit`/`quit`/Ctrl-D leave. Nothing is written to disk, so relaunching is a clean reset.
 #
 # The backend holds history in memory and re-sends it each turn; the provider
 # prefix-caches automatically server-side, and older turns are auto-compacted
@@ -189,6 +256,13 @@ ask() {
 # in-memory history; it shares nothing with the one-shot path. The API key is
 # passed via the environment (never argv, which `ps` can see; never to disk).
 chat() {
+  # --help first: chat takes no positional args, so any -h/--help wins, even
+  # without a TTY or key.
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == (-h|--help) ]] && { _chat_help; return 0 }
+  done
+
   # Hard interactive guard — a tool (no TTY and/or ASK_TOOL set) can never reach
   # the REPL; it should be using one-shot `ask` instead.
   [[ -t 0 && -t 1 && -z "$ASK_TOOL" ]] || {

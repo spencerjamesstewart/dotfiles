@@ -9,8 +9,8 @@ life of the process.
 Design / isolation notes (mirroring the framing in functions.zsh):
   * Stdlib only. We talk to OpenRouter directly over HTTPS with urllib (OpenAI
     Chat Completions format) — no SDK, so there is no pip/venv to manage. The
-    only external dependencies are python3 (always present) and `mdcat`
-    (rendering).
+    only external dependencies are python3 (always present), `mdcat`
+    (rendering), and macOS's own `sips`/`osascript` (images).
   * One model, defined once: MODEL below. Chat, one-shot, and compaction all use
     it; there is no model selection anywhere.
   * Nothing persists. The conversation is a plain in-memory list, re-sent in
@@ -24,11 +24,17 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     bracketed-paste support, so a pasted block submits line by line. `/edit`
     opens $EDITOR to compose or paste a whole message instead (see
     compose_in_editor); the buffer comes back as one turn.
+  * Images. Drag an image file onto the prompt (Ghostty pastes its path) or queue
+    the clipboard image with `/paste`. Each image is validated and downscaled
+    locally with macOS `sips` (no Pillow), sent inline as a base64 data URL, and
+    stays in the in-memory history so later turns can refer to it. Image
+    requests are routed only to the IMAGE_PROVIDERS allowlist (see below).
   * The API key arrives via the OPENROUTER_API_KEY env var, never on argv (which
     `ps` can see) and never on disk; we read it once and keep it in memory.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -52,10 +58,32 @@ MODEL = "deepseek/deepseek-v4.1-flash-1017"   # the one model, via OpenRouter
 MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
-# OpenRouter (OpenAI Chat Completions format). No provider routing prefs are
-# set, so OpenRouter picks freely; the --stats provider= field shows who served
-# each reply.
+# OpenRouter (OpenAI Chat Completions format). Routing prefs (see
+# call_openrouter): lowest-latency provider first; the --stats provider= field
+# shows who served each reply.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Images. MODEL accepts them, but OpenRouter exposes no per-provider "supports
+# images" flag and some providers serving this model reject or silently ignore
+# image parts. So any request carrying an image is pinned to this allowlist
+# (provider.only, OpenRouter endpoint tags) of providers verified to handle
+# them; text-only requests are unrestricted. Fallbacks stay within the list.
+# Empty = image requests are refused locally, before any API call.
+# The list was verified by probe on 2026-10-30 against
+# deepseek/deepseek-v4.1-flash-1017 (Fireworks tags left out on purpose, as are
+# tags that were unroutable). Re-probe if MODEL changes or image errors appear.
+IMAGE_PROVIDERS = [
+    "morph/fp8", "open-inference/fp4", "wafer/us", "reka", "wafer/mxfp4",
+    "relace", "deepinfra/fp8/flex", "inference-net/us", "inference-net/fp8",
+    "deepinfra/fp8", "cloudflare", "particle-ai", "streamlake/fp8", "decart/fp4",
+    "deepinfra/fp8/priority", "makora/fp8", "ionstream", "alibaba", "modelrun/fp4",
+    "digitalocean", "gmicloud/fp8", "cohere", "atlas-cloud/fp8", "novita/fp8",
+    "phala", "modal", "baidu/fp8", "crusoe/fp8", "venice/fp8", "mistral/fp8",
+    "nebius/fp8", "siliconflow/fp8", "together", "primeintellect", "baseten",
+    "parasail/fp8",
+]
+MAX_IMAGE_SIDE = 1344                 # longer side is downscaled to this (sips -Z)
+MAX_IMAGE_B64 = 5 * 1024 * 1024       # cap on one image's base64 payload
 
 # Auto-compaction (REPL only). When the effective prompt size crosses the
 # threshold, older turns are summarized by a cheap one-shot into a single
@@ -204,6 +232,24 @@ class _Spinner:
         return False
 
 
+def _has_image(messages):
+    """True if any message carries an image_url part (list content only)."""
+    return any(isinstance(m["content"], list)
+               and any(p.get("type") == "image_url" for p in m["content"])
+               for m in messages)
+
+
+def _wire_message(m):
+    """Copy of a stored message with private (`_`-prefixed) part keys such as
+    `_label` dropped, so OpenRouter never sees them. The stored message keeps
+    them (compaction uses the label)."""
+    if not isinstance(m["content"], list):
+        return m
+    parts = [{k: v for k, v in p.items() if not k.startswith("_")}
+             for p in m["content"]]
+    return {**m, "content": parts}
+
+
 def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
                     effort=None):
     """POST the whole conversation to OpenRouter; return (assistant_text, usage).
@@ -217,18 +263,31 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         uses its own default.
       * No cache markers are sent — the serving providers prefix-cache
         automatically.
+      * Routing: always `provider.sort = latency`. If ANY message in the list has
+        an image part (older turns count, e.g. after compaction keeps one), the
+        request is also limited to IMAGE_PROVIDERS. The file-parser plugin is
+        always disabled so nothing is processed in OpenRouter's cloud.
       * usage comes back with OpenAI names (prompt_tokens / completion_tokens /
         prompt_tokens_details.cached_tokens).
     Raises RuntimeError with a human-readable message on any API/network error;
     the caller keeps the REPL alive and leaves history intact.
     """
-    msgs = list(messages)
+    has_image = _has_image(messages)
+    provider = {"sort": "latency"}
+    if has_image:
+        if not IMAGE_PROVIDERS:
+            raise RuntimeError("images aren't enabled: IMAGE_PROVIDERS is empty "
+                               "in chat-repl.py, so no image request can be routed.")
+        provider["only"] = IMAGE_PROVIDERS
+    msgs = [_wire_message(m) for m in messages]
     if system:
         msgs = [{"role": "system", "content": system}] + msgs
     payload = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": msgs,
+        "provider": provider,
+        "plugins": [{"id": "file-parser", "enabled": False}],
     }
     if effort:
         payload["reasoning"] = {"effort": effort}
@@ -260,6 +319,10 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
                 detail = json.loads(detail)["error"]["message"]
             except Exception:
                 pass
+            if has_image and e.code in (404, 503):   # 503 only after retries ran out
+                raise RuntimeError(
+                    "no image-capable provider available; allowlisted: "
+                    f"{', '.join(IMAGE_PROVIDERS)} (API error {e.code}: {detail})")
             raise RuntimeError(f"API error {e.code}: {detail}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"network error: {e.reason}")
@@ -316,15 +379,18 @@ def _print_stats(elapsed, usage, total=None):
 
 def _serialize_transcript(messages):
     """Flatten stored messages into a plain `You:` / `Assistant:` transcript for
-    the summarizer. History is stored as string content; the block branch is
-    defensive only (in case a decorated message ever reaches here)."""
+    the summarizer. Content is a string, or a list of parts for a turn with
+    images; each image becomes `[image: <label>]`, so the summarizer request is
+    text-only (and so carries no image routing)."""
     lines = []
     for m in messages:
         who = "You" if m["role"] == "user" else "Assistant"
         content = m["content"]
         if not isinstance(content, str):
-            content = "".join(b.get("text", "") for b in content
-                              if isinstance(b, dict))
+            content = " ".join(
+                p.get("text", "") if p.get("type") == "text"
+                else f"[image: {p.get('_label', 'image')}]"
+                for p in content)
         lines.append(f"{who}: {content}")
     return "\n\n".join(lines)
 
@@ -487,7 +553,8 @@ def compose_in_editor(seed=""):
 # --file support (ask/chat). Extensions we explicitly refuse rather than try to
 # decode as text — the model behind these extensions is media, not prose, so a
 # UTF-8 read would just fail with a confusing "invalid byte" error; naming the
-# media type up front is clearer. v1 has no image/audio/video ingestion at all.
+# media type up front is clearer. --file never ingests media; in the chat REPL,
+# images go in by drag-and-drop or /paste instead (see load_image).
 BINARY_MEDIA_EXTS = {
     ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
     ".webp": "image", ".heic": "image", ".bmp": "image", ".tiff": "image",
@@ -553,6 +620,206 @@ def read_file_context(path):
 
     name = os.path.basename(path).replace('"', '\\"')
     return f'<file name="{name}">\n{text}\n</file>'
+
+
+# --- images (chat only) ---------------------------------------------------------
+# Pipeline: detect (drag-and-drop path / clipboard) → load_image (validate, convert,
+# downscale, all via macOS `sips` in a throwaway temp dir) → a dict that rides in
+# the message as a base64 data URL. Originals are never modified. Failures raise
+# RuntimeError, like read_file_context, so the REPL reports them and sends nothing.
+
+# Leading bytes → kind. Used both to recognise a dropped file as an image (so a
+# path to anything else stays plain text) and to identify sips' output.
+_HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm",
+                b"hevs", b"mif1", b"msf1"}
+FILE_KINDS = {"png", "jpeg", "gif", "webp", "heic"}   # accepted as files; TIFF only
+                                                       # arrives via the clipboard
+_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
+def _sniff_image(path):
+    """Image kind from magic bytes ('png', 'jpeg', 'gif', 'webp', 'heic', 'tiff'),
+    or None if it isn't one (or can't be read)."""
+    try:
+        with open(path, "rb") as f:
+            h = f.read(16)
+    except OSError:
+        return None
+    if h.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if h.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if h[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if h[:4] == b"RIFF" and h[8:12] == b"WEBP":
+        return "webp"
+    if h[4:8] == b"ftyp" and h[8:12] in _HEIF_BRANDS:
+        return "heic"
+    if h[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    return None
+
+
+def _image_size(path, label):
+    """(width, height) via sips. sips exits 0 even on a corrupt file (the fields
+    just come back `<nil>`), so validate by parsing, not by return code."""
+    proc = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+                          capture_output=True, text=True)
+    dims = dict(re.findall(r"pixel(Width|Height): (\d+)", proc.stdout))
+    if len(dims) != 2:
+        raise RuntimeError(f"can't read image (corrupt or unsupported): {label}")
+    return int(dims["Width"]), int(dims["Height"])
+
+
+def load_image(path, label):
+    """Validate and prepare one image; return {"label", "url", "info"} where url
+    is the data: URL and info is the one-line `attached:` description.
+
+    PNG/JPEG/WebP within MAX_IMAGE_SIDE pass through byte-for-byte. Anything else
+    goes through sips: oversize → downscaled (-Z); HEIC → JPEG; GIF (first frame)
+    and TIFF → PNG; oversize WebP → PNG (sips can't write WebP). If the base64
+    payload would still exceed MAX_IMAGE_B64, it is re-encoded as JPEG.
+    """
+    kind = _sniff_image(path)
+    if kind is None:
+        raise RuntimeError(f"not a supported image: {label}")
+    w, h = _image_size(path, label)
+    resize = max(w, h) > MAX_IMAGE_SIDE
+    # sips keeps the source format unless told otherwise, so always name one when
+    # converting. None = (maybe resize, but) keep the format.
+    fmt = {"heic": "jpeg", "gif": "png", "tiff": "png"}.get(kind)
+    if kind == "webp" and resize:
+        fmt = "png"
+
+    def run_sips(fmt, *extra):
+        """Run sips into a fresh temp dir; return (bytes, kind, (w, h))."""
+        with tempfile.TemporaryDirectory(prefix="chat-img-") as tmp:
+            out = os.path.join(tmp, "out")
+            cmd = ["sips", *extra]
+            if resize:
+                cmd += ["-Z", str(MAX_IMAGE_SIDE)]
+            if fmt:
+                cmd += ["-s", "format", fmt]
+            proc = subprocess.run(cmd + [path, "--out", out],
+                                  capture_output=True, text=True)
+            out_kind = _sniff_image(out)   # sniff: a failed sips can leave no file
+            if proc.returncode != 0 or out_kind not in ("png", "jpeg"):
+                raise RuntimeError(f"couldn't process image: {label}")
+            size = _image_size(out, label)
+            with open(out, "rb") as f:
+                return f.read(), out_kind, size
+
+    if kind in ("png", "jpeg", "webp") and not resize:
+        with open(path, "rb") as f:
+            data = f.read()
+        out_kind, size = kind, (w, h)
+    else:
+        data, out_kind, size = run_sips(fmt)
+    if len(data) * 4 // 3 > MAX_IMAGE_B64:
+        data, out_kind, size = run_sips("jpeg", "-s", "formatOptions", "80")
+        if len(data) * 4 // 3 > MAX_IMAGE_B64:
+            raise RuntimeError(f"image too large to send even as JPEG: {label}")
+
+    dims = f"{w}x{h}" if size == (w, h) else f"{w}x{h} → {size[0]}x{size[1]}"
+    kb = len(data) / 1024
+    weight = f"{kb / 1024:.1f} MB" if kb >= 1024 else f"{kb:.0f} KB"
+    b64 = base64.b64encode(data).decode("ascii")
+    return {"label": label,
+            "url": f"data:{_MIME[out_kind]};base64,{b64}",
+            "info": f"{label}  {dims}  {weight}"}
+
+
+# One whitespace-delimited word as a shell would see it: escaped chars, '…' and
+# "…" runs, bare chars — and a stray quote or backslash is taken literally, so an
+# apostrophe in prose ("what's this") doesn't wreck the whole line. Whitespace is
+# ASCII only: macOS screenshot names contain U+202F, which must stay in the token.
+_WORD = re.compile(r"""(?:\\.|'[^']*'|"(?:\\.|[^"\\])*"|[^ \t\r\n'"\\]|['"\\])+""",
+                   re.S)
+
+
+def extract_dropped_images(line):
+    """Find dragged-in image paths in `line`. Returns (text, paths): the line with
+    the attachment words cut out, and the absolute image paths.
+
+    Ghostty pastes a dropped file as a shell-escaped (or quoted) path. A word
+    counts only if, once unquoted and ~-expanded, it is an ABSOLUTE path to an
+    existing regular file whose magic bytes say image; everything else (relative
+    paths, URLs, other files, prose) is left in place untouched. Only the
+    whitespace around a removed word is normalised.
+    """
+    paths, kept, pos = [], [], 0
+    for m in _WORD.finditer(line):
+        try:
+            words = shlex.split(m.group())
+        except ValueError:
+            continue
+        path = os.path.expanduser(words[0]) if len(words) == 1 else ""
+        if os.path.isabs(path) and os.path.isfile(path) \
+                and _sniff_image(path) in FILE_KINDS:
+            paths.append(path)
+            kept.append(line[pos:m.start()])
+            pos = m.end()
+    if not paths:
+        return line, []
+    kept.append(line[pos:])
+    # Rejoin the pieces with one space, except where a newline already separates
+    # them (then keep a single newline).
+    text = kept[0]
+    for piece in kept[1:]:
+        text, piece = text.rstrip(" \t"), piece.lstrip(" \t")
+        if text.endswith("\n") and piece.startswith("\n"):
+            piece = piece[1:]
+        gap = "" if text.endswith("\n") or piece.startswith("\n") else " "
+        text += gap + piece
+    return text.strip(), paths
+
+
+def _osascript(script):
+    """Stdout of an AppleScript snippet, or None if it failed (e.g. the
+    clipboard has no data of the requested type)."""
+    proc = subprocess.run(["osascript", "-e", script],
+                          capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def clipboard_images():
+    """Images on the macOS clipboard, as a list of load_image() dicts.
+
+    Tried in order: (a) Finder-copied files; (b) PNG data (screenshots); (c) TIFF
+    data (what some apps put there). Raises RuntimeError if there is none.
+    """
+    # (a) File(s). `as list` + `as alias` rather than «class furl»: furl fails for
+    # several files, and coerces plain text like "hello" into the path "/hello".
+    files = _osascript('''set out to {}
+repeat with i in (the clipboard as list)
+    try
+        set end of out to POSIX path of (i as alias)
+    end try
+end repeat
+set AppleScript's text item delimiters to linefeed
+out as text''')
+    paths = [p for p in (files or "").splitlines() if os.path.isfile(p)]
+    if paths:   # real files are the answer — never fall through to their icon bitmap
+        bad = [os.path.basename(p) for p in paths if _sniff_image(p) not in FILE_KINDS]
+        if bad:
+            raise RuntimeError(f"clipboard file isn't a supported image: {bad[0]}")
+        return [load_image(p, os.path.basename(p)) for p in paths]
+    # (b)/(c) Raw image data. Have AppleScript write the bytes straight to a temp
+    # file (its stdout form is hex text, twice the size).
+    for code, ext in (("PNGf", "png"), ("TIFF", "tiff")):
+        with tempfile.TemporaryDirectory(prefix="chat-clip-") as tmp:
+            path = os.path.join(tmp, f"clipboard.{ext}")
+            ok = _osascript(f'''set d to the clipboard as «class {code}»
+set f to open for access POSIX file "{path}" with write permission
+try
+    set eof f to 0
+    write d to f
+end try
+close access f
+"ok"''')
+            if ok and _sniff_image(path):
+                return [load_image(path, f"clipboard.{ext}")]
+    raise RuntimeError("no image on the clipboard")
 
 
 def main():
@@ -671,6 +938,8 @@ def main():
         return 1
 
     messages = []       # the entire conversation, re-sent each turn; in memory only.
+    queued = []         # /paste'd (or image-only) attachments waiting for the next
+                        # message; load_image() dicts, cleared once a turn succeeds.
     last_usage = {}     # usage object from the most recent turn (for /usage + trigger)
     pending_file = file_block   # attached to the first message the user actually
                                  # sends; None once consumed. Set only from --file.
@@ -687,7 +956,7 @@ def main():
     file_note = f" · file: {os.path.basename(args.file)}" if pending_file else ""
     print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{file_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
-                      "commands: /reset /edit /compact /usage"),
+                      "commands: /reset /edit /compact /usage /paste /detach"),
           file=sys.stderr)
 
     # LABEL / CHIP_SGR / bar are shared with --render (see top of main()).
@@ -724,6 +993,7 @@ def main():
             break
         if msg == "/reset":
             messages.clear()
+            queued.clear()
             last_usage = {}
             print(_ansi("2", "context cleared."), file=sys.stderr)
             continue
@@ -740,6 +1010,25 @@ def main():
                       f"output={u.get('completion_tokens', 0)}  "
                       f"cached={details.get('cached_tokens', 0)}  "
                       f"provider={u.get('provider', '?').lower()}")
+            continue
+        if msg == "/paste":
+            # A slash command rather than a key binding: libedit can't run Python
+            # from a keystroke, so there's no way to hook Cmd-V / a hotkey here.
+            # The image is queued for the NEXT message, so type that text after.
+            try:
+                new = clipboard_images()
+            except RuntimeError as e:
+                print(_ansi("2", f"chat: {e}"), file=sys.stderr)
+                continue
+            queued.extend(new)
+            for img in new:
+                print(_ansi("2", f"attached: {img['info']}  (queued — type your message)"),
+                      file=sys.stderr)
+            continue
+        if msg == "/detach":
+            print(_ansi("2", f"dropped {len(queued)} queued image(s)." if queued
+                        else "no queued images."), file=sys.stderr)
+            queued.clear()
             continue
         if msg == "/compact":
             # Manual: runs regardless of threshold, ignores --no-compact, but still
@@ -763,6 +1052,36 @@ def main():
             sep = "\n" if "\n" in msg else " "
             print(f"❯{sep}{msg}")
 
+        # Drag-and-drop: Ghostty pastes a dropped file's path as typed text. Pull
+        # out any image paths and prepare them now, so a bad image fails here,
+        # before anything is sent.
+        text, dropped = extract_dropped_images(msg)
+        dropped_imgs = []
+        if dropped:
+            try:
+                dropped_imgs = [load_image(path, os.path.basename(path)) for path in dropped]
+            except RuntimeError as e:
+                print(_ansi("2", f"chat: {e}"), file=sys.stderr)
+                continue
+            if not text:            # image-only line: queue it, like /paste
+                queued.extend(dropped_imgs)
+                for img in dropped_imgs:
+                    print(_ansi("2", f"attached: {img['info']}  (queued — type your message)"),
+                          file=sys.stderr)
+                continue
+        images = queued + dropped_imgs
+        for img in images:
+            print(_ansi("2", f"attached: {img['info']}"), file=sys.stderr)
+        if dropped_imgs:            # only dragged images need confirming
+            try:
+                answer = input("send? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                answer = "n"
+            if answer not in ("", "y", "yes"):
+                print(_ansi("2", "discarded."), file=sys.stderr)
+                continue
+
         # Submit time for --stats total: input()/the editor just returned, so the
         # clock starts the moment the message is actually sent — time spent
         # composing in /edit never counts.
@@ -770,7 +1089,13 @@ def main():
         # Attach the pending --file block to the OUTGOING content, not to `msg`
         # itself — /edit's echo above already printed the bare `msg`, and later
         # turns must never re-inject the file (it lives in history from here).
-        outgoing = msg if pending_file is None else pending_file + "\n\n" + msg
+        outgoing = text if pending_file is None else pending_file + "\n\n" + text
+        if images:
+            # Text first, then the images (OpenRouter's recommended order). The
+            # `_label` key is ours: stripped before sending, used by compaction.
+            outgoing = [{"type": "text", "text": outgoing}] + [
+                {"type": "image_url", "image_url": {"url": img["url"]},
+                 "_label": img["label"]} for img in images]
         messages.append({"role": "user", "content": outgoing})
         try:
             # The spinner animates on stderr while the call blocks; the `with` stops
@@ -790,11 +1115,12 @@ def main():
             continue
 
         messages.append({"role": "assistant", "content": reply})
-        # Consume the pending file only now — after a confirmed successful
-        # turn. The RuntimeError/KeyboardInterrupt branches above `continue`
-        # before reaching here, so a failed or cancelled first send leaves
-        # pending_file set and the retry still carries the file.
+        # Consume the pending file (and queued images) only now — after a confirmed
+        # successful turn. The RuntimeError/KeyboardInterrupt branches above
+        # `continue` before reaching here, so a failed or cancelled send leaves
+        # them set and the retry still carries them.
         pending_file = None
+        queued.clear()
         print()                              # space between your line and the reply
         print(model_chip)                    # ` deepseek ` header chip
         shown = render(reply, bar)

@@ -28,7 +28,7 @@ being on screen (pager dwell excluded). In `chat` it is one line under every
 reply; in interactive `ask` the `total=` line follows the rendered answer (only
 the render stage can time it). Independent of `-v`, and piped stdout stays
 clean. `chat` additionally takes `--no-compact` and `--compact-threshold N`
-(see below).
+(see below). `-h`/`--help` prints usage for either.
 
 The default system prompt is extra-terse (just the answer, one line when
 possible). `-v` swaps it for a fuller-but-tight one.
@@ -52,7 +52,17 @@ Inside the `chat` REPL:
   under `--no-compact`).
 - `/usage` — print the last turn's token counts (input, output, cached) and the
   serving provider.
+- `/paste` — queue the clipboard image (Finder-copied file, screenshot) for the
+  next message; type your text after it. `/detach` drops queued images.
 - `exit` / `quit` / `Ctrl-D` — leave.
+
+**Images.** Drag an image file (PNG, JPEG, GIF, WebP, HEIC) onto the prompt, or
+`/paste` one. Each is checked and downscaled locally (long side ≤ 1344 px, via
+macOS `sips`; originals untouched), listed as a dim `attached:` line, and sent
+inline. Dragged images ask `send? [Y/n]` first. Images stay in the context for
+later turns (compaction keeps only an `[image: name]` note for old ones). Image
+requests are routed only to the `IMAGE_PROVIDERS` allowlist in
+`bin/chat-repl.py` and are refused while it is empty.
 
 Replies render inline; one that overflows the current pane opens in `less`
 (top-anchored, `q` to continue) instead of scrolling you to the bottom. Nothing
