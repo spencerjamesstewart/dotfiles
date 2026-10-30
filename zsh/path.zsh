@@ -7,3 +7,6 @@ export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 
 # Cargo-installed binaries (`cargo install`, e.g. ttyper)
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# study CLI (executable `study` lives in the study repo root)
+export PATH="$HOME/Documents/CodeRepos/study:$PATH"
