@@ -28,7 +28,8 @@ being on screen (pager dwell excluded). In `chat` it is one line under every
 reply; in interactive `ask` the `total=` line follows the rendered answer (only
 the render stage can time it). Independent of `-v`, and piped stdout stays
 clean. `chat` additionally takes `--no-compact` and `--compact-threshold N`
-(see below), and `--no-latency`. By default each `chat` reply ends with a dim
+(see below), `--no-latency`, and `-s`/`--starter NAME` or `--no-starter` (see
+Starter prompts). By default each `chat` reply ends with a dim
 `[latency Ns]` footer on stderr (the API wall time, plus the search count when it
 searched; `--stats` replaces it with its fuller line), and `--no-latency` hides
 it. `--no-search` turns off web search (below), for both. `-h`/`--help` prints
@@ -84,6 +85,35 @@ later turns (compaction keeps only an `[image: name]` note for old ones).
 Replies render inline; one that overflows the current pane opens in `less`
 (top-anchored, `q` to continue) instead of scrolling you to the bottom. Nothing
 is persisted — relaunching `chat` is a clean reset.
+
+### Starter prompts (chat)
+
+A starter prompt is standing context for a whole session, kept as a text file in
+`chat-prompts/` at the repo root (`.md` or `.txt`; the file name is the prompt's
+name). An optional first line `description: ...` labels it in the picker; the
+rest is the prompt itself, e.g. `I have neuroanatomy questions while I study for
+my A&P class.` A missing or empty library changes nothing: no picker, same
+startup.
+
+With any prompts present, `chat` opens a full-screen picker (stdlib only: raw
+terminal mode and ANSI, no fzf or curses) before the first prompt. The chosen
+text is appended to the system prompt, shown under a `starter: NAME` divider at
+startup and by `/system`, and re-sent with every request, so it survives `/reset`
+and `/compact`. Nothing is sent when you pick: it is context, not a question.
+The top row, `(none)`, starts with just the global prompt. Keys:
+
+- `↑`/`↓`, `j`/`k`, `Ctrl-P`/`Ctrl-N` — move; `Enter` — select; `Esc` or
+  `Ctrl-C` — skip the picker
+- `Ctrl-D`/`Ctrl-U` (half a pane), `PgDn`/`PgUp` — scroll the text pane
+- `m` — mark the highlighted prompt, then move to another one to see a word-level
+  diff against it (red strikethrough: only in the marked prompt; green
+  underline: only in the highlighted one); `m` on the marked prompt clears it,
+  and `Enter` still selects the highlighted prompt
+
+`chat -s NAME` (`--starter`) picks a prompt by name (case-insensitive; a unique
+prefix is enough) and skips the picker; `chat --no-starter` skips it and uses
+none. A starter counts toward the context size, so a long one triggers
+auto-compaction sooner.
 
 ### Caching & auto-compaction (chat)
 

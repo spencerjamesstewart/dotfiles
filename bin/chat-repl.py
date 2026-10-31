@@ -38,21 +38,33 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     tool and decides when to use it (~$0.007/search, +~3s). Replies that used it
     end with a Sources list (never stored in history); --no-search or the REPL's
     `/search off` turns it off. Compaction never searches.
+  * Starter prompts. Each .md/.txt file in chat-prompts/ is a standing-context
+    prompt (an optional first line `description: …` labels it). At startup a
+    stdlib-only picker (termios + ANSI) offers them, with a word-diff view for
+    telling similar ones apart; `--starter NAME` picks one by name and
+    `--no-starter` skips the picker. The choice is appended to --system and
+    re-sent every turn, never stored in the history, so /reset and /compact
+    keep it. The global prompt itself is still never copied here.
   * The API key arrives via the OPENROUTER_API_KEY env var, never on argv (which
     `ps` can see) and never on disk; we read it once and keep it in memory.
 """
 
 import argparse
 import base64
+import difflib
+import functools
 import http.client
 import json
 import os
 import re
+import select
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import textwrap
 import threading
 import time
@@ -73,6 +85,11 @@ TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 # Together first, fallbacks within PROVIDERS; the --stats provider= field shows
 # who served each reply.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Starter prompts (chat only): one .md/.txt file each, in <repo>/chat-prompts/.
+# Read at call time (see load_starters), so a test can point it elsewhere.
+STARTERS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "chat-prompts")
 
 # Provider pool (provider.only, OpenRouter endpoint tags) for every request.
 # Tags verified for BOTH image input and tool calling on 2026-10-30 against
@@ -488,17 +505,26 @@ def _print_stats(elapsed, usage, total=None):
     print(f"{prefix}{_ansi('2', line)}", file=sys.stderr)
 
 
-def _print_system(system):
+def _print_system(system, starter=None):
     """Print the system prompt to stderr as a dim, labelled, word-wrapped block
     (REPL startup and `/system`). Each line is styled on its own, so a wrapped
     block never leaves an SGR span open across a line break. Lines never break
-    at a hyphen, so hyphenated words in the prompt stay whole."""
+    at a hyphen, so hyphenated words in the prompt stay whole. A starter
+    (name, body) follows under a `starter: NAME` divider, in normal intensity and
+    wrapped per source line, so its own line breaks survive."""
     label = "system · "
     lines = textwrap.wrap(system, width=min(shutil.get_terminal_size().columns, 100),
                           initial_indent=label, subsequent_indent=" " * len(label),
                           break_on_hyphens=False)
     for line in lines:
         print(_ansi("2", line), file=sys.stderr)
+    if starter:
+        name, body = starter
+        width = min(shutil.get_terminal_size().columns, 100)
+        print(_ansi("2", f"── starter: {name} ──"), file=sys.stderr)
+        for src in _clean(body).split("\n"):
+            for line in textwrap.wrap(src, width=width, break_on_hyphens=False) or [""]:
+                print(line, file=sys.stderr)
 
 
 def _serialize_transcript(messages):
@@ -951,6 +977,397 @@ close access f
     raise RuntimeError("no image on the clipboard")
 
 
+# --- starter prompts (chat only) ------------------------------------------------
+# A library of standing-context prompts, one text file each. At REPL startup a
+# full-screen picker (stdlib only: termios + ANSI) chooses one, or none; its text
+# is appended to the system prompt for the whole session and is never sent as a
+# message. Esc / Ctrl-C / EOF in the picker mean "none".
+
+def load_starters():
+    """[(name, description, body), ...] from STARTERS_DIR: regular .md/.txt files,
+    not hidden, sorted by filename (case-insensitive); of duplicate names the
+    first wins. A first line `description: …` is split off as the description.
+    Unreadable or empty files are skipped, and a missing directory is just an
+    empty library."""
+    try:
+        files = sorted(os.listdir(STARTERS_DIR), key=lambda f: (f.lower(), f))
+    except OSError:
+        return []
+    starters, seen = [], set()
+    for fname in files:
+        name, ext = os.path.splitext(fname)
+        path = os.path.join(STARTERS_DIR, fname)
+        if (fname.startswith(".") or ext.lower() not in (".md", ".txt")
+                or name.lower() in seen or not os.path.isfile(path)):
+            continue
+        try:
+            # utf-8-sig, so a BOM can't hide the `description:` line
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+        text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+        first, _, rest = text.partition("\n")
+        m = re.match(r"description:\s*(.*)$", first, re.I)
+        desc = ""
+        if m:
+            desc, text = m.group(1).strip(), re.sub(r"\A(?:[ \t]*\n)+", "", rest)
+        if text:
+            seen.add(name.lower())
+            starters.append((name, desc, text))
+    return starters
+
+
+def find_starter(starters, name):
+    """The entry NAME refers to: a case-insensitive exact match, else a unique
+    case-insensitive prefix. Raises RuntimeError with a human-readable message
+    (no `chat:` prefix, like read_file_context) when there is none or several."""
+    if not starters:
+        raise RuntimeError(f"no starter prompts found in {STARTERS_DIR}")
+    low = name.lower()
+    for s in starters:
+        if s[0].lower() == low:
+            return s
+    hits = [s for s in starters if s[0].lower().startswith(low)]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise RuntimeError(f"'{name}' matches several starter prompts: "
+                           f"{', '.join(s[0] for s in hits)} (be more specific)")
+    raise RuntimeError(f"no starter prompt matches '{name}' "
+                       f"(available: {', '.join(s[0] for s in starters)})")
+
+
+# Picker drawing. Everything goes out as plain ANSI: alt screen, cursor
+# addressing, ESC[K, and a few SGR codes. Text is sanitized first, and no row is
+# ever drawn into the last column, so the terminal never autowraps or scrolls.
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")    # C0/C1 controls but \t, \n
+_DEL_SGR, _INS_SGR = "31;9", "32;4"     # diff view: only in A (red, struck) / only in B (green, underlined)
+
+
+def _clean(s):
+    """Text safe to draw or print: tabs become 4 spaces and every other control
+    character except newline is dropped, so a prompt file can't move the cursor
+    or restyle the screen."""
+    return _CTRL.sub("", s.replace("\t", "    "))
+
+
+def _one_line(s):
+    return " ".join(_clean(s).split())      # all whitespace → single spaces
+
+
+def _clip(s, w):
+    """s cut to at most w display columns, ending in … when it had to be cut."""
+    if w < 1:
+        return ""
+    out, n = [], 0
+    for ch in s:
+        cw = _display_width(ch)
+        if n + cw > w:
+            while out and n + 1 > w:        # make room for the …
+                n -= _display_width(out.pop())
+            return "".join(out) + "…"
+        out.append(ch)
+        n += cw
+    return s
+
+
+def _fit(s, w):
+    """s clipped to w columns, then space-padded to exactly w."""
+    s = _clip(s, w)
+    return s + " " * (w - _display_width(s))
+
+
+def _width(pieces):
+    return sum(_display_width(t) for _, t in pieces)
+
+
+def _styled(pieces):
+    """One wrapped line, [(sgr, text), ...], as a string with its SGR spans."""
+    return "".join(f"\033[{sgr}m{text}\033[0m" if sgr else text for sgr, text in pieces)
+
+
+def _hard_split(pieces, width):
+    """An over-long word [(sgr, text), ...] cut into lines of at most `width`
+    columns (a wide character is never split)."""
+    lines, cur, curw = [], [], 0
+    for sgr, text in pieces:
+        for ch in text:
+            cw = _display_width(ch)
+            if cur and curw + cw > width:
+                lines.append(cur)
+                cur, curw = [], 0
+            cur.append((sgr, ch))
+            curw += cw
+    return lines + [cur]
+
+
+def _wrap(chunks, width):
+    """Greedy word-wrap of [(sgr, text), ...] chunks into lines (lists of
+    (sgr, text) pieces) of at most `width` columns. A newline always breaks, so
+    blank lines survive; indentation is kept; spaces at a wrap point are dropped;
+    a word wider than a line is hard-split. A word may span chunks ("hello" + ",")."""
+    toks = []                       # (kind, pieces): "w"ord, "s"pace or "n"ewline
+    for sgr, text in chunks:
+        for m in re.finditer(r"\n|[^\S\n]+|\S+", text):
+            s = m.group()
+            kind = "n" if s == "\n" else "s" if s.isspace() else "w"
+            if kind == "w" and toks and toks[-1][0] == "w":
+                toks[-1][1].append((sgr, s))
+            else:
+                toks.append((kind, [(sgr, s)]))
+    lines, cur, curw, gap, gapw = [], [], 0, [], 0    # gap: spaces before the next word
+    for kind, pieces in toks:
+        if kind == "n":
+            lines.append(cur)
+            cur, curw, gap, gapw = [], 0, [], 0
+            continue
+        w = _width(pieces)
+        if kind == "s":
+            gap, gapw = gap + pieces, gapw + w
+        elif curw + gapw + w <= width:
+            cur, curw = cur + gap + pieces, curw + gapw + w
+            gap, gapw = [], 0
+        else:                       # no room: wrap, dropping the gap
+            if cur:
+                lines.append(cur)
+            parts = _hard_split(pieces, width) if w > width else [pieces]
+            lines += parts[:-1]
+            cur = parts[-1]
+            curw = _width(cur)
+            gap, gapw = [], 0
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+@functools.lru_cache(maxsize=8)     # recomputed only when the focus or mark moves
+def _diff_chunks(a, b):
+    """Word-level diff of prompt a (the marked one) against b (the focused one):
+    ([(sgr, text), ...] for _wrap, number of changes). Only word and punctuation
+    tokens are compared, so whitespace-only differences never show. b's own text
+    stands for matches and additions (additions green + underlined); a's words
+    that b lacks come first, red + struck through. Only the tokens are styled,
+    never the whitespace between them."""
+    ta, tb = (re.findall(r"(\w+|[^\w\s])(\s*)", _clean(s).strip()) for s in (a, b))
+    ops = difflib.SequenceMatcher(None, [t for t, _ in ta], [t for t, _ in tb],
+                                  autojunk=False).get_opcodes()
+    chunks, changes = [], 0
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            chunks.append(("", "".join(t + w for t, w in tb[j1:j2])))
+            continue
+        changes += 1
+        if tag in ("delete", "replace"):
+            if chunks and not chunks[-1][1][-1:].isspace():
+                chunks.append(("", " "))        # a deletion must not glue onto the word before
+            for t, _ in ta[i1:i2]:
+                chunks += [(_DEL_SGR, t), ("", " ")]
+        if tag in ("insert", "replace"):
+            for t, w in tb[j1:j2]:
+                chunks += [(_INS_SGR, t)] + ([("", w)] if w else [])
+    return chunks, changes
+
+
+def _list_rows(names, previews, focus, mark, top, count, cols):
+    """The picker's list rows top..top+count: cursor and mark markers, one space, a
+    shared name column, then the preview; the focused row in reverse video."""
+    nw = min(max(_display_width(s) for s in names), 24, max(8, (cols - 6) // 3))
+    out = []
+    for i in range(top, top + count):
+        text = (("▸" if i == focus else " ") + ("●" if i == mark else " ") + " "
+                + _fit(names[i], nw) + "  " + _clip(previews[i], cols - 6 - nw))
+        if i == focus:
+            text = f"\033[7m{text}{' ' * (cols - 1 - _display_width(text))}\033[0m"
+        out.append(text)
+    return out
+
+
+def _footer(cols, diff):
+    """The footer row: the dim key legend, cut at the last item that fits. In diff
+    mode it starts with the colour legend, `only in A` / `only in B` drawn in the
+    two diff styles, which fits at every usable width."""
+    pieces = [("2", " ")]
+    if diff:
+        pieces += [(_DEL_SGR, "only in A"), ("2", " · "), (_INS_SGR, "only in B")]
+    for key in ("↑↓ move", "Enter select", "m mark/compare", "^D/^U scroll", "Esc skip"):
+        item = ("2", (" · " if len(pieces) > 1 else "") + key)
+        if _width(pieces + [item]) > cols - 1:
+            break
+        pieces.append(item)
+    return _styled(pieces)
+
+
+def _read_key(fd, size):
+    """The next key press: 'up' 'down' 'pgup' 'pgdn' 'esc' 'eof', 'ignored' for
+    an unbound escape sequence, else the character itself. None once the window
+    size no longer matches `size`. Reads ONE byte at a time (more only inside an
+    escape sequence), so type-ahead after Enter stays in the tty queue for the
+    REPL's input()."""
+    while not select.select([fd], [], [], 0.25)[0]:
+        if shutil.get_terminal_size() != size:
+            return None
+    b = os.read(fd, 1)
+    if not b:
+        return "eof"
+    if b != b"\x1b":
+        return b.decode("latin-1")
+
+    def more():                     # next byte of the sequence; b"" if none follows
+        return os.read(fd, 1) if select.select([fd], [], [], 0.05)[0] else b""
+
+    c = more()
+    if not c or c == b"\x1b":
+        return "esc"                # a bare Esc (or two in a row), not a sequence
+    if c == b"O":                   # SS3: one more byte
+        return {b"A": "up", b"B": "down"}.get(more(), "ignored")
+    if c != b"[":
+        return "ignored"            # Alt-<key> or some other escape
+    params = b""
+    while True:                     # CSI: parameter bytes, then a final byte @..~
+        c = more()
+        if not c or 0x40 <= c[0] <= 0x7E:
+            break
+        params += c
+    return {(b"", b"A"): "up", (b"", b"B"): "down",
+            (b"5", b"~"): "pgup", (b"6", b"~"): "pgdn"}.get((params, c), "ignored")
+
+
+def _pick_loop(fd, starters):
+    """The picker's event loop, with the terminal already raw. Returns the chosen
+    (name, body), or None for no starter. Row 0 is `(none)`; starter i is row i.
+    A full frame is drawn after every key and every size change."""
+    n = len(starters)
+    names = ["(none)"] + [_one_line(name) for name, _, _ in starters]
+    previews = ["no starter — just the global pre-prompt"] + [
+        _one_line(desc or body) for _, desc, body in starters]
+    focus, mark, top, scroll = 0, None, 0, 0    # mark: a row >= 1 to compare against
+    prev_size = prev_view = None
+    while True:
+        size = shutil.get_terminal_size()
+        cols, rows = size.columns, size.lines
+        small = cols < 30 or rows < 8
+        if small:
+            screen = [_clip("terminal too small — Enter or Esc: no starter", cols - 1)]
+        else:
+            list_h = min(n + 1, max(3, rows // 3))
+            pane_h = rows - list_h - 2              # the rest: header, pane, footer
+            width = min(cols - 2, 100)
+            diff = mark is not None and focus not in (0, mark)
+            if focus == 0:
+                lines = _wrap([("2", "No starter prompt: chat starts with just the "
+                                     "global pre-prompt.")], width)
+            elif diff:
+                chunks, changes = _diff_chunks(starters[mark - 1][2], starters[focus - 1][2])
+                lines = _wrap(chunks, width)
+            else:
+                lines = _wrap([("", _clean(starters[focus - 1][2]))], width)
+            view = (focus, mark if diff else None)
+            if view != prev_view:                   # new content: back to the top
+                prev_view = view
+                scroll = 0
+                if diff:                            # ...a diff: just above its first change
+                    scroll = max(0, next((i for i, l in enumerate(lines)
+                                          if any(s for s, _ in l)), 0) - 1)
+            max_scroll = max(0, len(lines) - pane_h)
+            scroll = min(scroll, max_scroll)
+            top = max(0, min(max(top, focus - list_h + 1), focus, n + 1 - list_h))
+            if diff:
+                head = f"diff  A: {names[mark]} → B: {names[focus]} · {changes} change(s)"
+            elif focus == 0:
+                head = f"{names[0]} (0/{n})"
+            elif focus == mark:
+                head = f"{names[focus]} ({focus}/{n}) · marked — move to another prompt to compare"
+            else:
+                pct = 100 * scroll // max_scroll if max_scroll else 100
+                head = f"{names[focus]} ({focus}/{n}) · {len(starters[focus - 1][2])} chars · {pct}%"
+            pane = [" " + _styled(l) for l in lines[scroll:scroll + pane_h]]
+            screen = (_list_rows(names, previews, focus, mark, top, list_h, cols)
+                      + [f"\033[1m {_clip(head, cols - 2)}\033[0m"]
+                      + pane + [""] * (pane_h - len(pane))
+                      + [_footer(cols, diff)])
+        screen += [""] * (rows - len(screen))
+        sys.stdout.write(("\033[2J" if size != prev_size else "") + "".join(
+            f"\033[{r};1H{text}\033[K" for r, text in enumerate(screen, 1)))
+        sys.stdout.flush()
+        prev_size = size
+
+        key = _read_key(fd, size)
+        if key is None:                             # the window was resized
+            continue
+        if key in ("\r", "\n"):
+            return None if small or focus == 0 else (
+                starters[focus - 1][0], starters[focus - 1][2])
+        if key in ("esc", "eof", "\x03"):
+            return None
+        if small:
+            continue
+        if key in ("up", "k", "\x10"):
+            focus = max(0, focus - 1)
+        elif key in ("down", "j", "\x0e"):
+            focus = min(n, focus + 1)
+        elif key == "m" and focus:                  # not on (none)
+            mark = None if mark == focus else focus
+        elif key in ("\x04", "\x15", "pgdn", "pgup"):
+            step = {"\x04": pane_h // 2, "\x15": -(pane_h // 2),
+                    "pgdn": pane_h - 1, "pgup": 1 - pane_h}[key]
+            scroll = max(0, min(max_scroll, scroll + step))
+
+
+def _pick_starter(starters):
+    """Let the user pick one of `starters` full-screen; return (name, body), or
+    None for no starter. Also None, silently, when there is nothing to pick or no
+    usable terminal (not a TTY, TERM unset/dumb, termios refuses). The terminal is
+    always put back: alt screen, cursor, attributes, SIGTERM/SIGHUP handlers."""
+    if (not starters or not (sys.stdin.isatty() and sys.stdout.isatty())
+            or os.environ.get("TERM", "") in ("", "dumb")):
+        return None
+    fd = sys.stdin.fileno()
+    sigs = (signal.SIGTERM, signal.SIGHUP)
+    prev = [signal.getsignal(s) for s in sigs]
+    old = None                      # the original attributes, once read
+    entered = False                 # the alt screen may be on
+
+    def die(signum, frame):         # unwind through the finally below, then exit
+        raise SystemExit(128 + signum)
+
+    try:
+        for s in sigs:
+            signal.signal(s, die)
+        try:
+            old, raw = termios.tcgetattr(fd), termios.tcgetattr(fd)
+            raw[0] &= ~(termios.IXON | termios.ICRNL | termios.INLCR)
+            raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+            raw[6][termios.VMIN], raw[6][termios.VTIME] = 1, 0
+            termios.tcsetattr(fd, termios.TCSADRAIN, raw)     # DRAIN: never drop type-ahead
+        except (termios.error, OSError):
+            return None             # no usable terminal: skip silently
+        entered = True
+        sys.stdout.write("\033[?1049h\033[?25l")              # alt screen, hide cursor
+        return _pick_loop(fd, starters)
+    except KeyboardInterrupt:       # an external SIGINT; Ctrl-C itself arrives as a key
+        return None
+    finally:
+        # Nested, so a signal landing in the write can't skip the steps after it.
+        # Nothing polls or reads the tty afterwards: bytes typed ahead must stay
+        # queued, untouched, for the REPL's input().
+        try:
+            if entered:
+                sys.stdout.write("\033[0m\033[?25h\033[?1049l")
+                sys.stdout.flush()
+        except Exception:
+            pass
+        finally:
+            try:
+                if old is not None:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            except Exception:
+                pass
+            finally:
+                for s, h in zip(sigs, prev):
+                    signal.signal(s, h or signal.SIG_DFL)
+
+
 def main():
     # Roundtrip clock for --render --stats: this process spawns when the user
     # hits enter (the ask pipeline starts both stages at once), so main()'s
@@ -986,6 +1403,13 @@ def main():
     p.add_argument("--no-search", action="store_true",
                    help="don't offer the model web search (on by default); "
                         "the REPL's /search toggles it mid-session")
+    g = p.add_mutually_exclusive_group()             # REPL only
+    g.add_argument("--starter", metavar="NAME", default=None,
+                   help="start with this prompt from chat-prompts/ (name or unique "
+                        "prefix, case-insensitive) appended to the system prompt; "
+                        "skips the picker")
+    g.add_argument("--no-starter", action="store_true",
+                   help="use no starter prompt and skip the picker")
     args = p.parse_args()
 
     # Resolve --file BEFORE any key check or API call: a bad path should fail
@@ -1073,10 +1497,27 @@ def main():
         print("chat: --system is required for the REPL.", file=sys.stderr)
         return 2
 
+    # The starter prompt, (name, body) or None. A named one is resolved here, before
+    # the key check or any terminal work, so a typo fails fast and locally.
+    starter = None
+    if args.starter is not None:
+        try:
+            name, _, body = find_starter(load_starters(), args.starter)
+        except RuntimeError as e:
+            print(f"chat: {e}", file=sys.stderr)
+            return 2
+        starter = (name, body)
+
     key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     if not key:
         print("chat: no OPENROUTER_API_KEY in the environment.", file=sys.stderr)
         return 1
+
+    if args.starter is None and not args.no_starter:
+        starter = _pick_starter(load_starters())    # None when nothing to pick or no TTY
+    # The starter rides along with the global prompt on every request — never in
+    # `messages` — so /reset and /compact (which only touch history) keep it.
+    system = args.system + "\n\n" + starter[1] if starter else args.system
 
     messages = []       # the entire conversation, re-sent each turn; in memory only.
     queued = []         # /paste'd (or image-only) attachments waiting for the next
@@ -1098,11 +1539,12 @@ def main():
     latency_note = " · latency off" if args.no_latency else ""
     search_note = " · search off" if args.no_search else ""
     file_note = f" · file: {os.path.basename(args.file)}" if pending_file else ""
-    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{search_note}{file_note} · "
+    starter_note = f" · starter: {starter[0]}" if starter else ""
+    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{search_note}{file_note}{starter_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
                       "commands: /reset /edit /compact /usage /system /paste /detach /search"),
           file=sys.stderr)
-    _print_system(args.system)
+    _print_system(args.system, starter)
 
     # LABEL / CHIP_SGR / bar are shared with --render (see top of main()).
     # Both speakers get a chip on its OWN line, then their content below: ` you `
@@ -1158,7 +1600,7 @@ def main():
                       + "".join(f"  {f}" for f in _search_fields(u)))
             continue
         if msg == "/system":
-            _print_system(args.system)      # no API call, history untouched
+            _print_system(args.system, starter)     # no API call, history untouched
             continue
         if msg == "/search" or msg.startswith("/search "):
             arg = msg[8:].strip().lower()
@@ -1261,7 +1703,7 @@ def main():
             # and erases it on success, error, and Ctrl-C alike.
             with _Spinner(BAR_FG):
                 t_api = time.monotonic()
-                reply, last_usage = call_openrouter(key, MODEL, args.system,
+                reply, last_usage = call_openrouter(key, MODEL, system,
                                                     messages, effort=args.effort,
                                                     search=search_enabled)
                 elapsed = time.monotonic() - t_api

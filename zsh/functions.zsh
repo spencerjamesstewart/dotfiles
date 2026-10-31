@@ -115,6 +115,8 @@ Flags:
   --compact-threshold N       auto-compact at N input tokens (default 35000)
   --no-latency                hide per-reply [latency Ns] footer (on by default)
   --no-search                 don't let the model search the web (on by default)
+  -s, --starter NAME          start with that starter prompt (skips the picker)
+  --no-starter                no starter prompt and no picker
 
 In the REPL:
   /edit [text]      compose the next message in $EDITOR (multi-line input)
@@ -136,6 +138,14 @@ Web search: the model decides when to search (~$0.007/search, +~3s); replies
 that used it end with a Sources list. --stats and /usage add searches= and cost=.
 Requests go to Together first, falling back within a verified provider pool
 (PROVIDERS in bin/chat-repl.py).
+
+Starter prompts: each .md/.txt file in chat-prompts/ (repo root) is standing
+context for the session; an optional first line `description: ...` labels it.
+With any present, a picker opens at startup: arrows or j/k move, Enter selects
+the row (the top row, (none), is no starter), Esc skips, Ctrl-D/Ctrl-U scroll.
+m marks a prompt; moving to another one then shows a word-level diff against it.
+The chosen text is appended to the system prompt and kept across /reset and
+/compact. -s picks by name (a unique prefix works, any case).
 
 Requires OPENROUTER_API_KEY (export it in ~/.zshrc.local).
 
@@ -257,7 +267,9 @@ ask() {
 #
 # The startup banner states the effort in play for the session (plus an
 # `auto-compact off` / `latency off` / `search off` note when those flags are
-# given) and is followed by the system prompt in use, as a dim `system · …` block.
+# given, and `starter: NAME` when a starter prompt is in use) and is followed by
+# the system prompt in use, as a dim `system · …` block (a starter prompt follows
+# it under a `starter: NAME` divider).
 #   chat --no-compact           keep the whole history; disable auto-compaction
 #   chat --compact-threshold N  auto-compact once effective input ≥ N tokens
 #                               (default 35000)
@@ -272,6 +284,8 @@ ask() {
 #                               `/search [on|off]` shows or flips it in the REPL.
 #                               Auto-compaction skips a search turn (its token
 #                               count includes results that never enter history).
+#   chat -s NAME                start with starter prompt NAME (--starter; skips the picker)
+#   chat --no-starter           no starter prompt and no picker
 #
 # Verbosity and effort are fixed at launch (mirroring ask's flags). In the REPL:
 # `/reset` wipes the context; `/edit` composes in $EDITOR; `/compact` summarizes
@@ -314,6 +328,8 @@ chat() {
   local -a compact_args           # compaction flags forwarded to the backend
   local -a latency_args           # --no-latency, forwarded to the backend
   local -a search_args            # --no-search, forwarded to the backend
+  local starter=""                # -s/--starter <name> → forwarded as --starter to the backend
+  local -a starter_args=()        # --starter / --no-starter, forwarded to the backend
 
   while [[ "$1" == -* ]]; do
     case "$1" in
@@ -323,6 +339,10 @@ chat() {
         shift
         [[ -n "$1" ]] || { print -u2 "chat: --file needs a path."; return 1 }
         file="$1" ;;
+      -s|--starter)
+        shift
+        [[ -n "$1" ]] || { print -u2 "chat: --starter needs a name."; return 1 }
+        starter="$1" ;;
       -e|--effort)
         shift
         case "$1" in
@@ -339,6 +359,7 @@ chat() {
         compact_args+=(--compact-threshold "$1") ;;
       --no-latency) latency_args+=(--no-latency) ;;   # no short form
       --no-search)  search_args+=(--no-search) ;;     # no short form
+      --no-starter) starter_args+=(--no-starter) ;;   # no short form
       *) break ;;
     esac
     shift
@@ -347,6 +368,7 @@ chat() {
   local -a stats_args file_args
   [[ -n "$stats" ]] && stats_args=(--stats)
   [[ -n "$file" ]] && file_args=(--file "$file")
+  [[ -n "$starter" ]] && starter_args+=(--starter "$starter")
 
   [[ -n "$OPENROUTER_API_KEY" ]] || {
     print -u2 "chat: no OpenRouter key — export OPENROUTER_API_KEY (in ~/.zshrc.local)."
@@ -362,7 +384,7 @@ chat() {
   # only, even if ~/.zshrc.local forgot the `export`.
   OPENROUTER_API_KEY="$OPENROUTER_API_KEY" python3 "$_CHAT_BACKEND" \
     --system "$sys" --effort "$effort" \
-    "${compact_args[@]}" "${latency_args[@]}" "${search_args[@]}" "${stats_args[@]}" "${file_args[@]}"
+    "${compact_args[@]}" "${latency_args[@]}" "${search_args[@]}" "${stats_args[@]}" "${file_args[@]}" "${starter_args[@]}"
 }
 
 # scan2pdf: turn photos of pages into a cleaned-up, scanned-looking PDF.
