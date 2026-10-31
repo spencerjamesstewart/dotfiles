@@ -22,8 +22,8 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     here, so there is no drift. The REPL shows it (a dim `system · …` block) at
     startup and again on `/system`, so the pre-prompt in effect is never hidden.
   * Latency. Every reply is followed by a dim `[latency Ns]` footer on stderr
-    (API wall time); `--no-latency` hides it and `--stats` replaces it with the
-    fuller [stats] line.
+    (API wall time, plus the search count when it searched); `--no-latency`
+    hides it and `--stats` replaces it with the fuller [stats] line.
   * Multi-line input via the editor. libedit (the macOS readline) has no
     bracketed-paste support, so a pasted block submits line by line. `/edit`
     opens $EDITOR to compose or paste a whole message instead (see
@@ -31,14 +31,20 @@ Design / isolation notes (mirroring the framing in functions.zsh):
   * Images. Drag an image file onto the prompt (Ghostty pastes its path) or queue
     the clipboard image with `/paste`. Each image is validated and downscaled
     locally with macOS `sips` (no Pillow), sent inline as a base64 data URL, and
-    stays in the in-memory history so later turns can refer to it. Image
-    requests are routed only to the IMAGE_PROVIDERS allowlist (see below).
+    stays in the in-memory history so later turns can refer to it.
+  * Routing. Every request (chat, one-shot, compaction) tries Together first and
+    falls back only within the PROVIDERS pool (see below).
+  * Web search. On by default: the model gets OpenRouter's server-side search
+    tool and decides when to use it (~$0.007/search, +~3s). Replies that used it
+    end with a Sources list (never stored in history); --no-search or the REPL's
+    `/search off` turns it off. Compaction never searches.
   * The API key arrives via the OPENROUTER_API_KEY env var, never on argv (which
     `ps` can see) and never on disk; we read it once and keep it in memory.
 """
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -63,21 +69,18 @@ MODEL = "deepseek/deepseek-v4.1-flash-1017"   # the one model, via OpenRouter
 MAX_TOKENS = 8192   # a generous cap; you are billed for tokens used, not this.
 TIMEOUT = 300       # seconds — non-streaming, so allow slow/long replies.
 
-# OpenRouter (OpenAI Chat Completions format). Routing prefs (see
-# call_openrouter): lowest-latency provider first; the --stats provider= field
-# shows who served each reply.
+# OpenRouter (OpenAI Chat Completions format). Routing (see call_openrouter):
+# Together first, fallbacks within PROVIDERS; the --stats provider= field shows
+# who served each reply.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Images. MODEL accepts them, but OpenRouter exposes no per-provider "supports
-# images" flag and some providers serving this model reject or silently ignore
-# image parts. So any request carrying an image is pinned to this allowlist
-# (provider.only, OpenRouter endpoint tags) of providers verified to handle
-# them; text-only requests are unrestricted. Fallbacks stay within the list.
-# Empty = image requests are refused locally, before any API call.
-# The list was verified by probe on 2026-10-30 against
+# Provider pool (provider.only, OpenRouter endpoint tags) for every request.
+# Tags verified for BOTH image input and tool calling on 2026-10-30 against
 # deepseek/deepseek-v4.1-flash-1017 (Fireworks tags left out on purpose, as are
-# tags that were unroutable). Re-probe if MODEL changes or image errors appear.
-IMAGE_PROVIDERS = [
+# tags that were unroutable). Together is tried first; fallbacks stay inside the
+# list. relace and modal returned upstream 429 during the probe, so they are
+# untested rather than known-incapable, and kept. Re-probe if MODEL changes.
+PROVIDERS = [
     "morph/fp8", "open-inference/fp4", "wafer/us", "reka", "wafer/mxfp4",
     "relace", "deepinfra/fp8/flex", "inference-net/us", "inference-net/fp8",
     "deepinfra/fp8", "cloudflare", "particle-ai", "streamlake/fp8", "decart/fp4",
@@ -87,6 +90,18 @@ IMAGE_PROVIDERS = [
     "nebius/fp8", "siliconflow/fp8", "together", "primeintellect", "baseten",
     "parasail/fp8",
 ]
+
+# Web search: OpenRouter's server-side tool. OpenRouter runs the search loop and
+# returns one ordinary assistant message, so this client never handles tool
+# calls. Exa because MODEL has no native search (auto would pick it anyway), it
+# honors max_characters, and it costs ~$0.007/search. Caps keep prompts and cost
+# small: 3 results per search, 6 per turn, 1000 chars each, 2 searches per turn
+# (max_uses; call_openrouter also sends it top-level as max_tool_calls). Exa's
+# "mode": "fast" is accepted but was slower, not faster, when tried, so it's out.
+SEARCH_TOOL = {"type": "openrouter:web_search", "parameters": {
+    "engine": "exa", "max_results": 3, "max_total_results": 6,
+    "max_uses": 2, "max_characters": 1000}}
+
 MAX_IMAGE_SIDE = 1344                 # longer side is downscaled to this (sips -Z)
 MAX_IMAGE_B64 = 5 * 1024 * 1024       # cap on one image's base64 payload
 
@@ -239,13 +254,6 @@ class _Spinner:
         return False
 
 
-def _has_image(messages):
-    """True if any message carries an image_url part (list content only)."""
-    return any(isinstance(m["content"], list)
-               and any(p.get("type") == "image_url" for p in m["content"])
-               for m in messages)
-
-
 def _wire_message(m):
     """Copy of a stored message with private (`_`-prefixed) part keys such as
     `_label` dropped, so OpenRouter never sees them. The stored message keeps
@@ -257,8 +265,48 @@ def _wire_message(m):
     return {**m, "content": parts}
 
 
+def _search_info(message, usage):
+    """(search count, [(title, url), ...]) from a response; sources are deduped by
+    URL, in order. Either is 0 / empty when absent or malformed. Excerpts
+    (`content`) are never read."""
+    count = 0
+    for name in ("server_tool_use_details", "server_tool_use"):  # docs vs probes
+        d = usage.get(name)
+        n = d.get("web_search_requests") if isinstance(d, dict) else None
+        if isinstance(n, int) and not isinstance(n, bool):
+            count = n
+            break
+    sources, seen = [], set()
+    anns = message.get("annotations")
+    for a in anns if isinstance(anns, list) else []:
+        c = a.get("url_citation") if isinstance(a, dict) else None
+        url = c.get("url") if isinstance(c, dict) else None
+        if isinstance(url, str) and url and url not in seen:
+            seen.add(url)
+            title = c.get("title")
+            sources.append((title if isinstance(title, str) else "", url))
+    return count, sources
+
+
+def _sources_block(sources):
+    """The "Sources:" Markdown list for a reply, or "" when there are none. Titles
+    and URLs come from the web, so control characters (ESC included) are
+    flattened to spaces before anything reaches the terminal."""
+    if not sources:
+        return ""
+    lines = []
+    for i, (title, url) in enumerate(sources, 1):
+        title = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", title).strip()
+        title = title.lstrip("-*+#>• ")     # a leading marker would open a nested Markdown block
+        if len(title) > 80:
+            title = title[:79] + "…"
+        url = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", url).strip()
+        lines.append(f"{i}. {title} — {url}" if title else f"{i}. {url}")
+    return "\n\nSources:\n" + "\n".join(lines)
+
+
 def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
-                    effort=None, strict=False):
+                    effort=None, strict=False, search=False):
     """POST the whole conversation to OpenRouter; return (assistant_text, usage).
 
     Speaks OpenAI Chat Completions format:
@@ -271,24 +319,20 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
       * `strict=True` raises RuntimeError instead of returning marker text for a
         refused, truncated or empty reply — for callers (compaction) that can't
         use such a reply as real content.
+      * `search=True` offers SEARCH_TOOL; OpenRouter runs the searches itself.
+        The search count and the cited pages ride back in usage as `searches`
+        and `sources` ([(title, url), ...]), present only when non-empty.
       * No cache markers are sent — the serving providers prefix-cache
         automatically.
-      * Routing: always `provider.sort = latency`. If ANY message in the list has
-        an image part (older turns count, e.g. after compaction keeps one), the
-        request is also limited to IMAGE_PROVIDERS. The file-parser plugin is
-        always disabled so nothing is processed in OpenRouter's cloud.
+      * Routing: always Together first, with fallbacks restricted to PROVIDERS.
+        The file-parser plugin is always disabled so nothing is processed in
+        OpenRouter's cloud.
       * usage comes back with OpenAI names (prompt_tokens / completion_tokens /
         prompt_tokens_details.cached_tokens).
-    Raises RuntimeError with a human-readable message on any API/network error;
-    the caller keeps the REPL alive and leaves history intact.
+    Raises RuntimeError with a human-readable message on any API/network error
+    or malformed response; the caller keeps the REPL alive and leaves history
+    intact.
     """
-    has_image = _has_image(messages)
-    provider = {"sort": "latency"}
-    if has_image:
-        if not IMAGE_PROVIDERS:
-            raise RuntimeError("images aren't enabled: IMAGE_PROVIDERS is empty "
-                               "in chat-repl.py, so no image request can be routed.")
-        provider["only"] = IMAGE_PROVIDERS
     msgs = [_wire_message(m) for m in messages]
     if system:
         msgs = [{"role": "system", "content": system}] + msgs
@@ -296,11 +340,16 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         "model": model,
         "max_tokens": max_tokens,
         "messages": msgs,
-        "provider": provider,
+        "provider": {"order": ["together"], "only": PROVIDERS, "allow_fallbacks": True},
         "plugins": [{"id": "file-parser", "enabled": False}],
     }
     if effort:
         payload["reasoning"] = {"effort": effort}
+    hint = ""
+    if search:
+        payload["tools"] = [SEARCH_TOOL]
+        payload["max_tool_calls"] = SEARCH_TOOL["parameters"]["max_uses"]
+        hint = " (web search was on: /search off in chat, --no-search in ask)"
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         OPENROUTER_URL,
@@ -324,22 +373,44 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
             if e.code in (429, 502, 503) and attempt < 3:
                 time.sleep(2 ** attempt)
                 continue
-            detail = e.read().decode("utf-8", "replace")
+            try:                                # the body read can fail too
+                detail = e.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
             try:
                 detail = json.loads(detail)["error"]["message"]
             except Exception:
                 pass
-            if has_image and e.code in (404, 503):   # 503 only after retries ran out
-                raise RuntimeError(
-                    "no image-capable provider available; allowlisted: "
-                    f"{', '.join(IMAGE_PROVIDERS)} (API error {e.code}: {detail})")
-            raise RuntimeError(f"API error {e.code}: {detail}")
+            # 400/403/404 on a request carrying the search tool: search (no tool
+            # support, engine or region rejection) is the likely cause.
+            raise RuntimeError(f"API error {e.code}: {detail or e.reason}"
+                               f"{hint if e.code in (400, 403, 404) else ''}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"network error: {e.reason}")
+        except (OSError, http.client.HTTPException) as e:   # timeout, reset, cut-off body
+            raise RuntimeError(f"network error: {str(e) or type(e).__name__}")
+        except ValueError as e:                 # invalid JSON / non-UTF-8 body
+            raise RuntimeError(f"unreadable API response: {e}")
 
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    text = message.get("content") or ""     # None on some refusals → ""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        # A 200 can still carry an {"error": ...} object instead of choices.
+        err = data.get("error") if isinstance(data, dict) else None
+        err = err.get("message") if isinstance(err, dict) else err
+        raise RuntimeError(f"API error: {err}" if err else "API response had no choices")
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError("API response had no message")
+    if message.get("tool_calls"):
+        # The search tool runs server-side, so a client-side tool call is a
+        # provider quirk; this loop can't run it, and storing it would break history.
+        raise RuntimeError(f"model requested a tool call, which isn't supported{hint}")
+    text = message.get("content")           # None on some refusals → ""
+    if text is None:
+        text = ""
+    elif not isinstance(text, str):
+        raise RuntimeError("API response had non-text content")
     finish = choice.get("finish_reason")
     refusal = message.get("refusal")
     note = refusal or "provider content filter stopped the response"
@@ -361,12 +432,31 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
         text = f"{text}\n\n{marker}" if text.strip() else marker
     elif finish == "length":
         text += _ansi("2", f"\n\n[truncated at {max_tokens} tokens]")
-    usage = data.get("usage") or {}
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
     # OpenRouter names the serving provider top-level in the response; tuck it
     # into usage so it rides along to --stats / /usage without a wider return.
-    if data.get("provider"):
+    # Search results ride along the same way.
+    if isinstance(data.get("provider"), str) and data["provider"]:
         usage["provider"] = data["provider"]
+    searches, sources = _search_info(message, usage)
+    if searches:
+        usage["searches"] = searches
+    if sources:
+        usage["sources"] = sources
     return (text or _ansi("2", "[empty response]")), usage
+
+
+def _search_fields(usage):
+    """["searches=N", "cost=$X"] for a turn that searched, else []. cost is the
+    API's usage.cost (tokens + search fees), shown only alongside a search."""
+    n = usage.get("searches", 0)
+    if n <= 0:
+        return []
+    cost = usage.get("cost")
+    return [f"searches={n}"] + (
+        [f"cost=${cost:.4f}"] if isinstance(cost, (int, float)) else [])
 
 
 def _print_stats(elapsed, usage, total=None):
@@ -376,8 +466,8 @@ def _print_stats(elapsed, usage, total=None):
     message submitted → styled reply ready for the screen — appended when the
     caller can measure it (the chat REPL can; the one-shot process can't see the
     downstream render stage, which prints its own total= line instead). cached=
-    appears only when the provider reported a cached-token count. Purpose: tune
-    --compact-threshold from data.
+    appears only when the provider reported a cached-token count; searches= and
+    cost= only when the turn searched. Purpose: tune --compact-threshold from data.
     """
     tin = usage.get("prompt_tokens", 0)
     tout = usage.get("completion_tokens", 0)
@@ -390,6 +480,7 @@ def _print_stats(elapsed, usage, total=None):
         line += f" cached={cached}"
     if usage.get("provider"):            # who served this reply
         line += f" provider={usage['provider'].lower()}"
+    line += "".join(f" {f}" for f in _search_fields(usage))
     # \r + erase first: when `ask` pipes --oneshot into --render, the render
     # process's spinner may own the current stderr line — clear it so the stats
     # line never lands appended to a half-drawn spinner frame.
@@ -414,7 +505,7 @@ def _serialize_transcript(messages):
     """Flatten stored messages into a plain `You:` / `Assistant:` transcript for
     the summarizer. Content is a string, or a list of parts for a turn with
     images; each image becomes `[image: <label>]`, so the summarizer request is
-    text-only (and so carries no image routing)."""
+    text-only."""
     lines = []
     for m in messages:
         who = "You" if m["role"] == "user" else "Assistant"
@@ -453,7 +544,11 @@ def compact(key, messages, announce_skip=False):
                                      [{"role": "user", "content": _serialize_transcript(evict)}],
                                      max_tokens=COMPACT_MAX_TOKENS * 2, effort="low",
                                      strict=True)   # marker text must never become the summary
-    except RuntimeError as e:
+    except KeyboardInterrupt:
+        print(_ansi("2", "chat: compaction cancelled; history unchanged."),
+              file=sys.stderr)
+        return None
+    except Exception as e:      # RuntimeError from the API, or anything unexpected
         print(_ansi("2", f"chat: compaction failed ({e}); history unchanged."),
               file=sys.stderr)
         return None
@@ -888,6 +983,9 @@ def main():
                         "compaction (default 35000)")
     p.add_argument("--no-latency", action="store_true",  # REPL only
                    help="hide the per-reply [latency Ns] footer (on by default)")
+    p.add_argument("--no-search", action="store_true",
+                   help="don't offer the model web search (on by default); "
+                        "the REPL's /search toggles it mid-session")
     args = p.parse_args()
 
     # Resolve --file BEFORE any key check or API call: a bad path should fail
@@ -953,14 +1051,21 @@ def main():
             t0 = time.monotonic()
             text, usage = call_openrouter(key, MODEL, args.system or "",
                                           [{"role": "user", "content": prompt}],
-                                          effort=args.effort)
+                                          effort=args.effort,
+                                          search=not args.no_search)
             elapsed = time.monotonic() - t0
         except RuntimeError as e:
             print(f"ask: {e}", file=sys.stderr)
             return 1
+        except Exception as e:      # never a traceback
+            print(f"ask: unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
         if args.stats:
             _print_stats(elapsed, usage)
         text = re.sub(r"\033\[[0-9;]*m", "", text)   # drop marker styling
+        # Sources are part of the answer (a piped answer keeps them), so they
+        # go to stdout right after it.
+        text += _sources_block(usage.get("sources"))
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         return 0
 
@@ -980,6 +1085,7 @@ def main():
     pending_file = file_block   # attached to the first message the user actually
                                  # sends; None once consumed. Set only from --file.
     compact_enabled = not args.no_compact
+    search_enabled = not args.no_search     # /search flips it
     compact_threshold = (args.compact_threshold if args.compact_threshold is not None
                          else COMPACT_THRESHOLD)   # an explicit flag wins
 
@@ -990,10 +1096,11 @@ def main():
     effort_note = f" · effort {args.effort}" if args.effort else ""
     compact_note = "" if compact_enabled else " · auto-compact off"
     latency_note = " · latency off" if args.no_latency else ""
+    search_note = " · search off" if args.no_search else ""
     file_note = f" · file: {os.path.basename(args.file)}" if pending_file else ""
-    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{file_note} · "
+    print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{search_note}{file_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
-                      "commands: /reset /edit /compact /usage /system /paste /detach"),
+                      "commands: /reset /edit /compact /usage /system /paste /detach /search"),
           file=sys.stderr)
     _print_system(args.system)
 
@@ -1047,10 +1154,21 @@ def main():
                 print(f"input={u.get('prompt_tokens', 0)}  "
                       f"output={u.get('completion_tokens', 0)}  "
                       f"cached={details.get('cached_tokens', 0)}  "
-                      f"provider={u.get('provider', '?').lower()}")
+                      f"provider={u.get('provider', '?').lower()}"
+                      + "".join(f"  {f}" for f in _search_fields(u)))
             continue
         if msg == "/system":
             _print_system(args.system)      # no API call, history untouched
+            continue
+        if msg == "/search" or msg.startswith("/search "):
+            arg = msg[8:].strip().lower()
+            if arg in ("on", "off"):
+                search_enabled = arg == "on"
+            elif arg:
+                print(_ansi("2", "usage: /search [on|off]"), file=sys.stderr)
+                continue
+            print(_ansi("2", f"web search {'on' if search_enabled else 'off'}."),
+                  file=sys.stderr)
             continue
         if msg == "/paste":
             # A slash command rather than a key binding: libedit can't run Python
@@ -1144,7 +1262,8 @@ def main():
             with _Spinner(BAR_FG):
                 t_api = time.monotonic()
                 reply, last_usage = call_openrouter(key, MODEL, args.system,
-                                                    messages, effort=args.effort)
+                                                    messages, effort=args.effort,
+                                                    search=search_enabled)
                 elapsed = time.monotonic() - t_api
         except RuntimeError as e:
             messages.pop()          # drop the unanswered turn → history stays valid
@@ -1154,17 +1273,23 @@ def main():
             messages.pop()
             print(_ansi("2", "cancelled."), file=sys.stderr)
             continue
+        except Exception as e:      # a bug or odd response must not end the session
+            messages.pop()
+            print(_ansi("2", f"chat: unexpected error: {type(e).__name__}: {e}"),
+                  file=sys.stderr)
+            continue
 
         messages.append({"role": "assistant", "content": reply})
         # Consume the pending file (and queued images) only now — after a confirmed
-        # successful turn. The RuntimeError/KeyboardInterrupt branches above
-        # `continue` before reaching here, so a failed or cancelled send leaves
-        # them set and the retry still carries them.
+        # successful turn. The error/KeyboardInterrupt branches above `continue`
+        # before reaching here, so a failed or cancelled send leaves them set and
+        # the retry still carries them.
         pending_file = None
         queued.clear()
         print()                              # space between your line and the reply
         print(model_chip)                    # ` deepseek ` header chip
-        shown = render(reply, bar)
+        # Sources are shown with the reply but never stored: history keeps the bare text.
+        shown = render(reply + _sources_block(last_usage.get("sources")), bar)
         # total = submit → styled reply ready for the screen, so it covers the
         # API call AND the mdcat/styling work. Measured before the pager: less
         # paints instantly, but a long reply can sit in it while you read, and
@@ -1176,17 +1301,21 @@ def main():
             # never gets buried above a paged answer.
             _print_stats(elapsed, last_usage, total=total)
         elif not args.no_latency:
-            # Default footer (API wall time only); --stats' line already has it.
-            print(_ansi("2", f"[latency {elapsed:.2f}s]"), file=sys.stderr)
+            # Default footer (API wall time, + search count); --stats' line already has it.
+            n = last_usage.get("searches", 0)
+            note = f", {n} search{'' if n == 1 else 'es'}" if n > 0 else ""
+            print(_ansi("2", f"[latency {elapsed:.2f}s{note}]"), file=sys.stderr)
 
         # Auto-compaction. Done AFTER rendering so it never delays the current reply.
         # A successful compaction drops the prompt well below threshold, so it can't
         # re-fire until the conversation grows large again.
-        if compact_enabled and last_usage:
+        # Skipped after a search turn: its prompt_tokens includes search results that
+        # never enter history, so it overstates the real context.
+        if compact_enabled and last_usage and not last_usage.get("searches"):
             # prompt_tokens is the whole prompt, cached or not, so it IS the
             # effective input.
             effective_input = last_usage.get("prompt_tokens", 0)
-            if effective_input >= compact_threshold:
+            if isinstance(effective_input, int) and effective_input >= compact_threshold:
                 new = compact(key, messages)
                 if new is not None:
                     messages = new
