@@ -78,18 +78,21 @@ _ask_help() {
   cat <<'EOF'
 Usage: ask [flags] "question"
 
-One-shot question to an LLM (deepseek via OpenRouter).
+One-shot question to an LLM (deepseek via OpenRouter). Flags go before the
+question and can be combined. See `chat -h` for the interactive REPL.
 
 Flags:
   -h, --help          show this help
   -e, --effort LEVEL  thinking depth: low (default) | medium | high
   -v, --verbose       fuller-but-tight answer instead of the terse default
   --stats             dim [stats] lines on stderr (latency, tokens, total)
-  --file PATH         prepend a text/Markdown/code file (or PDF) as context
+  --file PATH         prepend one text/Markdown/code file (or PDF, needs
+                      pdftotext) as context; needs a question too
   --no-search         don't let the model search the web (on by default)
 
 Requires OPENROUTER_API_KEY (export it in ~/.zshrc.local).
 Output is Markdown-rendered in a terminal, raw when piped or ASK_TOOL is set.
+When the model searched, a Sources list follows the answer.
 
 Examples:
   ask "tar flags to extract a .tgz"
@@ -127,6 +130,7 @@ In the REPL:
   /paste            queue the clipboard image for the next message
   /detach           drop queued images
   /search [on|off]  show or set web search (on by default)
+  /help             show this list
   exit, quit        leave (Ctrl-D also works)
 
 Images: drag an image file onto the prompt (PNG, JPEG, GIF, WebP, HEIC) or use
@@ -141,9 +145,18 @@ Requests go to Together first, falling back within a verified provider pool
 
 Starter prompts: each .md/.txt file in chat-prompts/ (repo root) is standing
 context for the session; an optional first line `description: ...` labels it.
-With any present, a picker opens at startup: arrows or j/k move, Enter selects
-the row (the top row, (none), is no starter), Esc skips, Ctrl-D/Ctrl-U scroll.
-m marks a prompt; moving to another one then shows a word-level diff against it.
+A full-screen picker opens at startup (even when empty, so `a` can add one);
+the top row, (none), is no starter. Keys:
+  Up/Down, j/k, Ctrl-P/Ctrl-N   move
+  PgUp/PgDn, Ctrl-U/Ctrl-D      scroll the text pane
+  Enter                         select the highlighted row
+  Esc, Ctrl-C                   skip the picker (no starter)
+  m                             mark a prompt; move to another to see a
+                                word-level diff against it (m again clears)
+  a                             add: asks a name, then opens the editor
+  e                             edit the highlighted prompt in the editor
+  d                             delete it to the Trash, after a y/N confirm
+Add/edit use $VISUAL, else $EDITOR, else nvim, else vi.
 The chosen text is appended to the system prompt and kept across /reset and
 /compact. -s picks by name (a unique prefix works, any case).
 

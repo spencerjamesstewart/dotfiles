@@ -32,8 +32,8 @@ clean. `chat` additionally takes `--no-compact` and `--compact-threshold N`
 Starter prompts). By default each `chat` reply ends with a dim
 `[latency Ns]` footer on stderr (the API wall time, plus the search count when it
 searched; `--stats` replaces it with its fuller line), and `--no-latency` hides
-it. `--no-search` turns off web search (below), for both. `-h`/`--help` prints
-usage for either.
+it. `--no-search` turns off web search (below), for both. `ask -h`/`chat -h`
+(`--help`) print usage for each, with no API key or network needed.
 
 The default system prompt is extra-terse (just the answer, one line when
 possible). `-v` swaps it for a fuller-but-tight one. `chat` prints the prompt in
@@ -72,6 +72,8 @@ Inside the `chat` REPL:
 - `/search [on|off]` — show or set web search for the rest of the session.
 - `/system` — re-print the system prompt in use (it is also shown at startup);
   makes no API request.
+- `/help` — list these commands (the startup banner points to it). `chat -h`
+  shows the same list plus every flag and the picker keys.
 - `/paste` — queue the clipboard image (Finder-copied file, screenshot) for the
   next message; type your text after it. `/detach` drops queued images.
 - `exit` / `quit` / `Ctrl-D` — leave.

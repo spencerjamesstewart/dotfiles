@@ -508,6 +508,23 @@ def _print_stats(elapsed, usage, total=None):
     print(f"{prefix}{_ansi('2', line)}", file=sys.stderr)
 
 
+# The REPL command list shown by /help. zsh/functions.zsh `_chat_help` carries a
+# copy of this text under "In the REPL:" (zsh can't import Python) — keep the two
+# in sync by hand when a command is added or reworded.
+REPL_HELP = """\
+In the REPL:
+  /edit [text]      compose the next message in $EDITOR (multi-line input)
+  /reset            clear the conversation context
+  /compact          summarize older turns now
+  /usage            show the last turn's token counts
+  /system           show the system prompt in use (also printed at startup)
+  /paste            queue the clipboard image for the next message
+  /detach           drop queued images
+  /search [on|off]  show or set web search (on by default)
+  /help             show this list
+  exit, quit        leave (Ctrl-D also works)"""
+
+
 def _print_system(system, starter=None):
     """Print the system prompt to stderr as a dim, labelled, word-wrapped block
     (REPL startup and `/system`). Each line is styled on its own, so a wrapped
@@ -1696,7 +1713,7 @@ def main():
     starter_note = f" · starter: {starter[0]}" if starter else ""
     print(_ansi("2", f"chat · {LABEL}{effort_note}{compact_note}{latency_note}{search_note}{file_note}{starter_note} · "
                       "'exit'/'quit'/Ctrl-D to leave · "
-                      "commands: /reset /edit /compact /usage /system /paste /detach /search"),
+                      "/help for commands"),
           file=sys.stderr)
     _print_system(args.system, starter)
 
@@ -1737,6 +1754,10 @@ def main():
             queued.clear()
             last_usage = {}
             print(_ansi("2", "context cleared."), file=sys.stderr)
+            continue
+        if msg == "/help":
+            for line in REPL_HELP.split("\n"):     # per line, like _print_system
+                print(_ansi("2", line), file=sys.stderr)
             continue
         if msg == "/usage":
             if not last_usage:
