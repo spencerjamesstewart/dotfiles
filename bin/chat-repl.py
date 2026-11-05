@@ -525,6 +525,19 @@ In the REPL:
   exit, quit        leave (Ctrl-D also works)"""
 
 
+_SLASH_WORD = re.compile(r"/[A-Za-z0-9_-]*")
+
+
+def _is_slash_command_word(msg):
+    """True when the first whitespace-delimited word of `msg` is `/` plus only
+    letters, digits, `_` or `-` (so `/foo`, `/Help`, a bare `/`). A word with
+    further slashes or dots (`/etc/hosts`, `/tmp/a.png`) is a path, not a command
+    — it still goes to the model, and dragged-in image paths still reach
+    extract_dropped_images."""
+    words = msg.split(None, 1)
+    return bool(words) and _SLASH_WORD.fullmatch(words[0]) is not None
+
+
 def _print_system(system, starter=None):
     """Print the system prompt to stderr as a dim, labelled, word-wrapped block
     (REPL startup and `/system`). Each line is styled on its own, so a wrapped
@@ -1812,6 +1825,15 @@ def main():
             new = compact(key, messages, announce_skip=True)
             if new is not None:
                 messages = new
+            continue
+        # Every known command above is matched exactly (case-sensitive); anything
+        # else shaped like a command is rejected here rather than sent to the model.
+        # This must stay BEFORE /edit: its result falls through to the send path
+        # and an edited message that starts with "/" is deliberate text.
+        if msg != "/edit" and not msg.startswith("/edit ") and _is_slash_command_word(msg):
+            print(_ansi("2", f"unknown command: {msg.split(None, 1)[0]}"), file=sys.stderr)
+            for hline in REPL_HELP.split("\n"):
+                print(_ansi("2", hline), file=sys.stderr)
             continue
         if msg == "/edit" or msg.startswith("/edit "):
             # Anything after "/edit " seeds the buffer (e.g. "/edit fix this:").

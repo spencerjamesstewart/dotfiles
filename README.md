@@ -78,6 +78,9 @@ Inside the `chat` REPL:
   next message; type your text after it. `/detach` drops queued images.
 - `exit` / `quit` / `Ctrl-D` — leave.
 
+An unknown `/word` (e.g. `/foo`) is rejected with the command list, not sent to the
+model; a path such as `/etc/hosts` is still sent as text.
+
 **Images.** Drag an image file (PNG, JPEG, GIF, WebP, HEIC) onto the prompt, or
 `/paste` one. Each is checked and downscaled locally (long side ≤ 1344 px, via
 macOS `sips`; originals untouched), listed as a dim `attached:` line, and sent
