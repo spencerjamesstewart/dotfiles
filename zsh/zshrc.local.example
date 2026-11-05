@@ -5,7 +5,7 @@
 # dotfiles repo stays free of credentials.
 
 # --- Secrets ---
-# Required for `ask`/`chat` (deepseek-v4.1-flash-1017 via OpenRouter).
+# Required for `chat` (deepseek-v4.1-flash-1017 via OpenRouter).
 export OPENROUTER_API_KEY="sk-or-v1-REPLACE_ME"
 
 # --- Per-machine overrides (optional) ---

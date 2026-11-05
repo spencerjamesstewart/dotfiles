@@ -11,14 +11,14 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     Chat Completions format) — no SDK, so there is no pip/venv to manage. The
     only external dependencies are python3 (always present), `mdcat`
     (rendering), and macOS's own `sips`/`osascript` (images).
-  * One model, defined once: MODEL below. Chat, one-shot, and compaction all use
+  * One model, defined once: MODEL below. Chat and compaction both use
     it; there is no model selection anywhere.
   * Nothing persists. The conversation is a plain in-memory list, re-sent in
     full each turn and discarded when the process exits. We import `readline`
     for in-session line editing but NEVER write a history file, so relaunching
     is a clean, cheap reset. `/reset` wipes the context mid-session.
   * Single source of truth for prompts. The system prompt arrives via --system
-    (the shared _ASK_SYS_* strings defined in the shell); it is never copied
+    (the shared _CHAT_SYS_* strings defined in the shell); it is never copied
     here, so there is no drift. The REPL shows it (a dim `system · …` block) at
     startup and again on `/system`, so the pre-prompt in effect is never hidden.
   * Latency. Every reply is followed by a dim `[latency Ns]` footer on stderr
@@ -32,7 +32,7 @@ Design / isolation notes (mirroring the framing in functions.zsh):
     the clipboard image with `/paste`. Each image is validated and downscaled
     locally with macOS `sips` (no Pillow), sent inline as a base64 data URL, and
     stays in the in-memory history so later turns can refer to it.
-  * Routing. Every request (chat, one-shot, compaction) tries Together first and
+  * Routing. Every request (chat, compaction) tries Together first and
     falls back only within the PROVIDERS pool (see below).
   * Web search. On by default: the model gets OpenRouter's server-side search
     tool and decides when to use it (~$0.007/search, +~3s). Replies that used it
@@ -130,7 +130,7 @@ MAX_IMAGE_B64 = 5 * 1024 * 1024       # cap on one image's base64 payload
 # synthetic exchange, keeping the recent tail intact. On by default; the
 # `--no-compact` flag disables only the automatic trigger (manual `/compact`
 # still works). The summarizer prompt lives HERE, not in functions.zsh — it's an
-# internal implementation detail, not one of the user-facing _ASK_SYS_* prompts.
+# internal implementation detail, not one of the user-facing _CHAT_SYS_* prompts.
 # The summarizer is the same MODEL as the chat itself.
 COMPACT_MAX_TOKENS = 600
 # Effective input tokens (see main loop). Triggers late: compacting too eagerly
@@ -235,10 +235,9 @@ def _chip(label, sgr):
 
 class _Spinner:
     """An animated braille spinner + elapsed-seconds counter shown on stderr while
-    the main thread is blocked waiting for a reply — the network call in `chat`, or
-    stdin from `llm` in --render. A daemon thread does the animation, so it keeps
-    ticking *through* the blocking call (CPython releases the GIL during socket/stdin
-    reads). No-op when stderr isn't a TTY. Used as a context manager around the wait;
+    the main thread is blocked waiting for a reply — the network call in `chat`. A
+    daemon thread does the animation, so it keeps ticking *through* the blocking
+    call (CPython releases the GIL during socket reads). No-op when stderr isn't a TTY. Used as a context manager around the wait;
     __exit__ stops the thread and erases the line — on success, errors, and Ctrl-C.
     """
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -369,7 +368,7 @@ def call_openrouter(key, model, system, messages, max_tokens=MAX_TOKENS,
     if search:
         payload["tools"] = [SEARCH_TOOL]
         payload["max_tool_calls"] = SEARCH_TOOL["parameters"]["max_uses"]
-        hint = " (web search was on: /search off in chat, --no-search in ask)"
+        hint = " (web search was on: /search off in chat, or --no-search)"
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         OPENROUTER_URL,
@@ -484,9 +483,7 @@ def _print_stats(elapsed, usage, total=None):
     clean. Requests here are non-streaming, so latency is the whole request wall
     time and there is no tokens/sec figure. `total` is the full roundtrip —
     message submitted → styled reply ready for the screen — appended when the
-    caller can measure it (the chat REPL can; the one-shot process can't see the
-    downstream render stage, which prints its own total= line instead). cached=
-    appears only when the provider reported a cached-token count; searches= and
+    caller can measure it (the chat REPL does). cached= appears only when the provider reported a cached-token count; searches= and
     cost= only when the turn searched. Purpose: tune --compact-threshold from data.
     """
     tin = usage.get("prompt_tokens", 0)
@@ -501,9 +498,8 @@ def _print_stats(elapsed, usage, total=None):
     if usage.get("provider"):            # who served this reply
         line += f" provider={usage['provider'].lower()}"
     line += "".join(f" {f}" for f in _search_fields(usage))
-    # \r + erase first: when `ask` pipes --oneshot into --render, the render
-    # process's spinner may own the current stderr line — clear it so the stats
-    # line never lands appended to a half-drawn spinner frame.
+    # \r + erase first, so the stats line never lands appended to a
+    # half-drawn spinner frame on the same stderr line.
     prefix = "\r\033[K" if sys.stderr.isatty() else ""
     print(f"{prefix}{_ansi('2', line)}", file=sys.stderr)
 
@@ -738,7 +734,7 @@ def compose_in_editor(seed=""):
             pass
 
 
-# --file support (ask/chat). Extensions we explicitly refuse rather than try to
+# --file support. Extensions we explicitly refuse rather than try to
 # decode as text — the model behind these extensions is media, not prose, so a
 # UTF-8 read would just fail with a confusing "invalid byte" error; naming the
 # media type up front is clearer. --file never ingests media; in the chat REPL,
@@ -765,7 +761,7 @@ def read_file_context(path):
     up front with a clear message instead of an opaque decode error.
 
     Raises RuntimeError with a human-readable message on any failure; callers
-    (in main()) already have the RuntimeError → "ask:"/"chat:" prefix
+    (in main()) already have the RuntimeError → "chat:" prefix
     convention, so nothing here talks to stderr except the near-empty-PDF
     warning, which is a non-fatal heads-up, not an error.
     """
@@ -791,8 +787,8 @@ def read_file_context(path):
         if len(re.sub(r"\s", "", text)) < 50:
             # Not fatal — a thin/scanned PDF still yields whatever text layer
             # exists (maybe none); let the caller decide whether that's useful.
-            # "warning:" rather than an ask:/chat: prefix — this helper serves
-            # both modes and can't know which one is running.
+            # "warning:" rather than a chat: prefix — this helper is a
+            # non-fatal heads-up, not an error.
             print(_ansi("2", f"warning: {path} extracted almost no text — it "
                              "may be scanned/image-heavy; OCR isn't supported."),
                   file=sys.stderr)
@@ -1553,27 +1549,16 @@ def _pick_starter(starters):
 
 
 def main():
-    # Roundtrip clock for --render --stats: this process spawns when the user
-    # hits enter (the ask pipeline starts both stages at once), so main()'s
-    # start is the closest measurable point to "enter" — only the interpreter's
-    # own startup (tens of ms) precedes it.
-    t0 = time.monotonic()
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--system")                       # required for the REPL only
-    p.add_argument("--render", action="store_true",  # render-from-stdin mode for `ask`
-                   help="render Markdown from stdin (with badge/bar) and exit")
-    p.add_argument("--oneshot", action="store_true",  # generate-and-print mode for `ask`
-                   help="generate from --system + prompt args, print raw text, exit")
-    p.add_argument("prompt", nargs="*",              # the prompt, in --oneshot mode
-                   help="prompt text (--oneshot only; pass after `--`)")
     p.add_argument("--effort", choices=("low", "medium", "high"),
                    help="thinking-depth dial (OpenRouter reasoning.effort); "
                         "omit to use the model's default")
     p.add_argument("--file",
                    help="path to a text/Markdown/code file (or PDF, via local "
                         "pdftotext) whose contents are injected as context "
-                        "ahead of the message; --oneshot prepends it to the "
-                        "prompt, the REPL attaches it to the first message typed")
+                        "ahead of the message; the REPL attaches it to the "
+                        "first message typed")
     p.add_argument("--stats", action="store_true",
                    help="print one [stats] line (wall time + token counts) per "
                         "API call to stderr")
@@ -1597,12 +1582,10 @@ def main():
     args = p.parse_args()
 
     # Resolve --file BEFORE any key check or API call: a bad path should fail
-    # fast and locally, never burn a network round-trip. The oneshot/REPL modes
-    # share one error-message prefix convention (RuntimeError → "ask:"/"chat:"),
-    # picked here by --oneshot since that's the only signal available this early.
+    # fast and locally, never burn a network round-trip.
     file_block = None
     if args.file:
-        prefix = "ask" if args.oneshot else "chat"
+        prefix = "chat"
         try:
             file_block = read_file_context(args.file)
         except RuntimeError as e:
@@ -1610,72 +1593,6 @@ def main():
             return 1
 
     bar = f"\033[{BAR_FG}m{GUTTER}\033[0m" if sys.stdout.isatty() else None
-
-    # --render: the one-shot path for `ask`. Read the whole answer from stdin (it's
-    # already generated — no API key or system prompt needed) and give it the same
-    # model badge + gutter bar + restyled headings a chat reply gets, then exit. The
-    # spinner covers the wait while the upstream `llm` is still streaming into us.
-    if args.render:
-        with _Spinner(BAR_FG):
-            text = sys.stdin.read()
-        text = text.strip("\n")
-        if not text:
-            return 0
-        if sys.stdout.isatty():
-            print(_chip(LABEL, CHIP_SGR))
-        shown = render(text, bar)
-        total = time.monotonic() - t0   # enter → answer ready for the screen
-        _page(shown)
-        if args.stats:
-            # The one-shot process already printed latency/tokens (it made the API
-            # call); this side owns the rest of the roundtrip — the stdin wait
-            # (= the API call), mdcat, and styling. Printed after the pager so
-            # it lands under the answer; pager dwell is excluded from total.
-            print(_ansi("2", f"[stats] total={total:.2f}s"), file=sys.stderr)
-        return 0
-
-    # --oneshot: the generate-and-print path for `ask`. POST a single Messages
-    # request and write the raw answer to stdout; the interactive `ask` then pipes
-    # it back through --render. Strip any ANSI the [truncated]/[empty response]
-    # markers add so escapes never leak into the Markdown mdcat renders downstream.
-    if args.oneshot:
-        key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-        if not key:
-            print("ask: no OPENROUTER_API_KEY in the environment.", file=sys.stderr)
-            return 1
-        prompt = " ".join(args.prompt).strip()
-        if not prompt:
-            if file_block:
-                # A bare --file with no question is almost certainly a mistake
-                # (nothing to answer), and silently no-op'ing would hide it.
-                print("ask: --file needs a question to go with it.", file=sys.stderr)
-                return 1
-            return 0
-        if file_block:
-            # File first, question after — a cache-friendly prefix, and reads
-            # naturally as "here's the context, now the question".
-            prompt = file_block + "\n\n" + prompt
-        try:
-            t0 = time.monotonic()
-            text, usage = call_openrouter(key, MODEL, args.system or "",
-                                          [{"role": "user", "content": prompt}],
-                                          effort=args.effort,
-                                          search=not args.no_search)
-            elapsed = time.monotonic() - t0
-        except RuntimeError as e:
-            print(f"ask: {e}", file=sys.stderr)
-            return 1
-        except Exception as e:      # never a traceback
-            print(f"ask: unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
-            return 1
-        if args.stats:
-            _print_stats(elapsed, usage)
-        text = re.sub(r"\033\[[0-9;]*m", "", text)   # drop marker styling
-        # Sources are part of the answer (a piped answer keeps them), so they
-        # go to stdout right after it.
-        text += _sources_block(usage.get("sources"))
-        sys.stdout.write(text if text.endswith("\n") else text + "\n")
-        return 0
 
     if not args.system:
         print("chat: --system is required for the REPL.", file=sys.stderr)
@@ -1730,7 +1647,7 @@ def main():
           file=sys.stderr)
     _print_system(args.system, starter)
 
-    # LABEL / CHIP_SGR / bar are shared with --render (see top of main()).
+    # LABEL / CHIP_SGR are module constants; bar is built near the top of main().
     # Both speakers get a chip on its OWN line, then their content below: ` you `
     # above your input, ` deepseek ` above the reply. The you-chip is printed directly
     # (NOT baked into the readline prompt) for a hard reason — macOS libedit mishandles
