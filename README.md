@@ -92,15 +92,16 @@ A starter prompt is standing context for a whole session, kept as a text file in
 `chat-prompts/` at the repo root (`.md` or `.txt`; the file name is the prompt's
 name). An optional first line `description: ...` labels it in the picker; the
 rest is the prompt itself, e.g. `I have neuroanatomy questions while I study for
-my A&P class.` A missing or empty library changes nothing: no picker, same
-startup.
+my A&P class.` You rarely need to create these by hand: the picker can add, edit
+and delete them (below).
 
-With any prompts present, `chat` opens a full-screen picker (stdlib only: raw
+`chat` opens a full-screen picker (stdlib only: raw
 terminal mode and ANSI, no fzf or curses) before the first prompt. The chosen
 text is appended to the system prompt, shown under a `starter: NAME` divider at
 startup and by `/system`, and re-sent with every request, so it survives `/reset`
 and `/compact`. Nothing is sent when you pick: it is context, not a question.
-The top row, `(none)`, starts with just the global prompt. Keys:
+The top row, `(none)`, starts with just the global prompt. The picker opens even
+when the library is empty (only `(none)`), so `a` can add the first prompt. Keys:
 
 - `↑`/`↓`, `j`/`k`, `Ctrl-P`/`Ctrl-N` — move; `Enter` — select; `Esc` or
   `Ctrl-C` — skip the picker
@@ -109,6 +110,16 @@ The top row, `(none)`, starts with just the global prompt. Keys:
   diff against it (red strikethrough: only in the marked prompt; green
   underline: only in the highlighted one); `m` on the marked prompt clears it,
   and `Enter` still selects the highlighted prompt
+- `a` — add a prompt: asks for a name (lowercase letters, digits and hyphens;
+  must not exist yet), then opens a new `chat-prompts/NAME.md` in
+  `$VISUAL`/`$EDITOR` (else `nvim`, else `vi`). Saving it empty discards it.
+- `e` — edit the highlighted prompt in the editor
+- `d` — delete the highlighted prompt after a `y/N` confirmation. It goes to the
+  Trash via the `trash` command; without `trash` on `PATH` nothing is deleted.
+  `e` and `d` do nothing on `(none)`.
+
+After `a`/`e`/`d` the picker reloads the library, clears any `m` mark, and keeps
+running. Without a terminal (piped input) it is skipped as before.
 
 `chat -s NAME` (`--starter`) picks a prompt by name (case-insensitive; a unique
 prefix is enough) and skips the picker; `chat --no-starter` skips it and uses

@@ -41,8 +41,10 @@ Design / isolation notes (mirroring the framing in functions.zsh):
   * Starter prompts. Each .md/.txt file in chat-prompts/ is a standing-context
     prompt (an optional first line `description: …` labels it). At startup a
     stdlib-only picker (termios + ANSI) offers them, with a word-diff view for
-    telling similar ones apart; `--starter NAME` picks one by name and
-    `--no-starter` skips the picker. The choice is appended to --system and
+    telling similar ones apart, and `a`/`e`/`d` keys to add, edit (in $EDITOR) and
+    delete (to the Trash, never rm) files without leaving the picker; the picker
+    opens even with an empty library so `a` can start one. `--starter NAME`
+    picks one by name and `--no-starter` skips the picker. The choice is appended to --system and
     re-sent every turn, never stored in the history, so /reset and /compact
     keep it. The global prompt itself is still never copied here.
   * The API key arrives via the OPENROUTER_API_KEY env var, never on argv (which
@@ -51,6 +53,7 @@ Design / isolation notes (mirroring the framing in functions.zsh):
 
 import argparse
 import base64
+import contextlib
 import difflib
 import functools
 import http.client
@@ -1038,6 +1041,107 @@ def find_starter(starters, name):
                        f"(available: {', '.join(s[0] for s in starters)})")
 
 
+# --- starter management (picker keys a / e / d) ---------------------------------
+# File operations behind the picker's add / edit / delete, kept free of any
+# terminal handling so they can be called (and tested) without a TTY. Each
+# returns a short message for the picker's footer ("" when there is nothing to say).
+
+_STARTER_EXTS = (".md", ".txt")
+_KEBAB = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def _starter_file(name):
+    """Path of the starter file NAME (case-insensitive; same files and order as
+    load_starters), or None."""
+    try:
+        files = sorted(os.listdir(STARTERS_DIR), key=lambda f: (f.lower(), f))
+    except OSError:
+        return None
+    for fname in files:
+        stem, ext = os.path.splitext(fname)
+        path = os.path.join(STARTERS_DIR, fname)
+        if (not fname.startswith(".") and ext.lower() in _STARTER_EXTS
+                and stem.lower() == name.lower() and os.path.isfile(path)):
+            return path
+    return None
+
+
+def _name_problem(name):
+    """Why NAME can't be a new starter's name (a short message), or "" if it can."""
+    if not name:
+        return "empty name"
+    if not _KEBAB.match(name):
+        return f"'{name}': use lowercase letters, digits and single hyphens"
+    if _starter_file(name):
+        return f"'{name}' already exists"
+    return ""
+
+
+def _run_editor(path):
+    """Open PATH in $VISUAL / $EDITOR (else nvim, else vi) and wait. Returns a
+    message if it couldn't launch or exited non-zero, else ""."""
+    editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR")
+              or ("nvim" if shutil.which("nvim") else "vi"))
+    try:
+        rc = subprocess.run([*shlex.split(editor), path], check=False).returncode
+    except (OSError, ValueError) as e:
+        return f"could not launch editor '{editor}': {e}"
+    return f"editor exited {rc}" if rc else ""
+
+
+def _add_starter(name):
+    """Create STARTERS_DIR/NAME.md (and the directory), edit it, and keep it only
+    if it ends up non-empty. NAME must already have passed _name_problem."""
+    path = os.path.join(STARTERS_DIR, name + ".md")
+    try:
+        os.makedirs(STARTERS_DIR, exist_ok=True)
+        open(path, "x").close()             # "x": never overwrite a file made meanwhile
+    except OSError as e:
+        return f"could not create {name}.md: {e}"
+    note = _run_editor(path)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            empty = not f.read().strip()
+    except OSError:
+        empty = True                        # the editor removed or renamed it
+    if empty:
+        try:
+            os.unlink(path)                 # our own empty file: nothing to trash
+        except OSError:
+            pass
+        return note or f"{name}: empty, discarded"
+    return note or f"added {name}"
+
+
+def _edit_starter(name):
+    path = _starter_file(name)
+    return _run_editor(path) if path else f"{name}: file not found"
+
+
+def _trash_starter(name):
+    """Move the starter's file to the Trash with `trash`; refuses (rather than
+    deleting for good) when `trash` isn't on PATH."""
+    path = _starter_file(name)
+    if not path:
+        return f"{name}: file not found"
+    trash = shutil.which("trash")
+    if not trash:
+        return "`trash` not found on PATH: not deleted"
+    if subprocess.run([trash, path], check=False, capture_output=True).returncode:
+        return f"trash failed: {name} not deleted"
+    return f"moved {name} to Trash"
+
+
+def _ask_new_name():
+    """Ask for a new starter's name (cooked mode). Returns (name, "") or ("", why)."""
+    try:
+        name = input("New starter name (lowercase-kebab-case, empty to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return "", "cancelled"
+    problem = _name_problem(name)
+    return ("", problem) if problem else (name, "")
+
+
 # Picker drawing. Everything goes out as plain ANSI: alt screen, cursor
 # addressing, ESC[K, and a few SGR codes. Text is sanitized first, and no row is
 # ever drawn into the last column, so the terminal never autowraps or scrolls.
@@ -1190,7 +1294,8 @@ def _footer(cols, diff):
     pieces = [("2", " ")]
     if diff:
         pieces += [(_DEL_SGR, "only in A"), ("2", " · "), (_INS_SGR, "only in B")]
-    for key in ("↑↓ move", "Enter select", "m mark/compare", "^D/^U scroll", "Esc skip"):
+    for key in ("↑↓ move", "Enter select", "a add · e edit · d del", "m mark/compare",
+                "^D/^U scroll", "Esc skip"):
         item = ("2", (" · " if len(pieces) > 1 else "") + key)
         if _width(pieces + [item]) > cols - 1:
             break
@@ -1233,16 +1338,25 @@ def _read_key(fd, size):
             (b"5", b"~"): "pgup", (b"6", b"~"): "pgdn"}.get((params, c), "ignored")
 
 
-def _pick_loop(fd, starters):
+def _picker_rows(starters):
+    """(names, previews) for the list rows; row 0 is `(none)`."""
+    return (["(none)"] + [_one_line(name) for name, _, _ in starters],
+            ["no starter — just the global pre-prompt"] + [
+                _one_line(desc or body) for _, desc, body in starters])
+
+
+def _pick_loop(fd, starters, suspend):
     """The picker's event loop, with the terminal already raw. Returns the chosen
     (name, body), or None for no starter. Row 0 is `(none)`; starter i is row i.
-    A full frame is drawn after every key and every size change."""
+    A full frame is drawn after every key and every size change. `a`/`e`/`d` add,
+    edit and delete starters; `suspend()` is a context manager that hands the
+    terminal back (cooked, normal screen) for the prompt and the editor. Any
+    change reloads the library and clears the mark."""
     n = len(starters)
-    names = ["(none)"] + [_one_line(name) for name, _, _ in starters]
-    previews = ["no starter — just the global pre-prompt"] + [
-        _one_line(desc or body) for _, desc, body in starters]
+    names, previews = _picker_rows(starters)
     focus, mark, top, scroll = 0, None, 0, 0    # mark: a row >= 1 to compare against
     prev_size = prev_view = None
+    note = ""                                   # one-frame message in the footer
     while True:
         size = shutil.get_terminal_size()
         cols, rows = size.columns, size.lines
@@ -1256,7 +1370,8 @@ def _pick_loop(fd, starters):
             diff = mark is not None and focus not in (0, mark)
             if focus == 0:
                 lines = _wrap([("2", "No starter prompt: chat starts with just the "
-                                     "global pre-prompt.")], width)
+                                     "global pre-prompt."
+                                     + ("" if n else " Press a to add one."))], width)
             elif diff:
                 chunks, changes = _diff_chunks(starters[mark - 1][2], starters[focus - 1][2])
                 lines = _wrap(chunks, width)
@@ -1285,7 +1400,8 @@ def _pick_loop(fd, starters):
             screen = (_list_rows(names, previews, focus, mark, top, list_h, cols)
                       + [f"\033[1m {_clip(head, cols - 2)}\033[0m"]
                       + pane + [""] * (pane_h - len(pane))
-                      + [_footer(cols, diff)])
+                      + [_styled([("33", " " + _clip(note, cols - 3))]) if note
+                         else _footer(cols, diff)])
         screen += [""] * (rows - len(screen))
         sys.stdout.write(("\033[2J" if size != prev_size else "") + "".join(
             f"\033[{r};1H{text}\033[K" for r, text in enumerate(screen, 1)))
@@ -1295,6 +1411,7 @@ def _pick_loop(fd, starters):
         key = _read_key(fd, size)
         if key is None:                             # the window was resized
             continue
+        note = ""
         if key in ("\r", "\n"):
             return None if small or focus == 0 else (
                 starters[focus - 1][0], starters[focus - 1][2])
@@ -1312,14 +1429,39 @@ def _pick_loop(fd, starters):
             step = {"\x04": pane_h // 2, "\x15": -(pane_h // 2),
                     "pgdn": pane_h - 1, "pgup": 1 - pane_h}[key]
             scroll = max(0, min(max_scroll, scroll + step))
+        elif key == "a" or (key in ("e", "d") and focus):
+            target = starters[focus - 1][0] if focus else ""
+            if key == "a":
+                with suspend():
+                    target, note = _ask_new_name()
+                    if target:
+                        note = _add_starter(target)
+            elif key == "e":
+                with suspend():
+                    note = _edit_starter(target)
+            else:                                   # confirm in the footer row
+                sys.stdout.write(f"\033[{rows};1H\033[1m "
+                                 + _clip(f"Move '{names[focus]}' to the Trash? [y/N]", cols - 3)
+                                 + "\033[0m\033[K")
+                sys.stdout.flush()
+                note = (_trash_starter(target) if _read_key(fd, size) in ("y", "Y")
+                        else "cancelled")
+            starters = load_starters()
+            n = len(starters)
+            names, previews = _picker_rows(starters)
+            mark = prev_view = prev_size = None     # indices moved; redraw from scratch
+            focus = next((i for i, s in enumerate(starters, 1)
+                          if s[0].lower() == target.lower()), min(focus, n))
 
 
 def _pick_starter(starters):
-    """Let the user pick one of `starters` full-screen; return (name, body), or
-    None for no starter. Also None, silently, when there is nothing to pick or no
-    usable terminal (not a TTY, TERM unset/dumb, termios refuses). The terminal is
-    always put back: alt screen, cursor, attributes, SIGTERM/SIGHUP handlers."""
-    if (not starters or not (sys.stdin.isatty() and sys.stdout.isatty())
+    """Let the user pick one of `starters` full-screen (and add, edit or delete
+    them); return (name, body), or None for no starter. Also None, silently, when
+    there is no usable terminal (not a TTY, TERM unset/dumb, termios refuses); an
+    empty library still opens the picker, so `a` can add the first one. The
+    terminal is always put back: alt screen, cursor, attributes, SIGTERM/SIGHUP
+    handlers."""
+    if (not (sys.stdin.isatty() and sys.stdout.isatty())
             or os.environ.get("TERM", "") in ("", "dumb")):
         return None
     fd = sys.stdin.fileno()
@@ -1330,6 +1472,18 @@ def _pick_starter(starters):
 
     def die(signum, frame):         # unwind through the finally below, then exit
         raise SystemExit(128 + signum)
+
+    @contextlib.contextmanager
+    def suspend():                  # cooked mode + normal screen; picker state back after
+        sys.stdout.write("\033[0m\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:
+            yield
+        finally:                    # also on an exception: the outer finally restores for good
+            termios.tcsetattr(fd, termios.TCSADRAIN, raw)
+            sys.stdout.write("\033[?1049h\033[?25l")
+            sys.stdout.flush()
 
     try:
         for s in sigs:
@@ -1344,7 +1498,7 @@ def _pick_starter(starters):
             return None             # no usable terminal: skip silently
         entered = True
         sys.stdout.write("\033[?1049h\033[?25l")              # alt screen, hide cursor
-        return _pick_loop(fd, starters)
+        return _pick_loop(fd, starters, suspend)
     except KeyboardInterrupt:       # an external SIGINT; Ctrl-C itself arrives as a key
         return None
     finally:
